@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include "usb_device.h"
 
 /* USER CODE END Includes */
 
@@ -136,11 +137,12 @@ int main(void)
 {
   /* MCU Configuration */
   HAL_Init();
-  /* SystemClock_Config(); */ /* Skipped - causes debugger disconnect. Using HSI clock as-is. */
+  SystemClock_Config();
   MPU_Config();
   
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_USB_DEVICE_Init();
   
   /* Main loop */
   while (1)
@@ -163,15 +165,10 @@ void SystemClock_Config(void)
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Supply configuration update enable
-  */
-  HAL_PWREx_ConfigSupply(PWR_LDO_SUPPLY);
-
-  /** Configure the main internal regulator output voltage
-  */
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
-
-  while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
+  /* Skip power config - already done in SystemInit() */
+  /* HAL_PWREx_ConfigSupply(PWR_LDO_SUPPLY); */
+  /* __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3); */
+  /* timeout loop for VOSRDY skipped */
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.

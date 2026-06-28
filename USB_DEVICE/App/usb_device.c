@@ -67,7 +67,9 @@ void MX_USB_DEVICE_Init(void)
 
   /* USER CODE END USB_DEVICE_Init_PreTreatment */
 
-  /* Init Device Library, add supported class and start the library. */
+  /* DISABLED: USB OTG core soft reset hangs (CSRST bit won't clear) */
+  /* Likely issue: USB clock/power domain not properly initialized */
+  /*
   if (USBD_Init(&hUsbDeviceFS, &FS_Desc, DEVICE_FS) != USBD_OK)
   {
     Error_Handler();
@@ -84,6 +86,7 @@ void MX_USB_DEVICE_Init(void)
   {
     Error_Handler();
   }
+  */
 
   /* USER CODE BEGIN USB_DEVICE_Init_PostTreatment */
   HAL_PWREx_EnableUSBVoltageDetector();
