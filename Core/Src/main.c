@@ -154,6 +154,13 @@ int main(void)
   uint32_t counter = 0;
   uint8_t usb_buffer[128];
   int16_t gyro_x, gyro_y, gyro_z;
+  int16_t accel_x, accel_y, accel_z;
+  
+  /* Integration variables for angle calculation */
+  float pitch_deg = 0.0f;
+  float roll_deg = 0.0f;
+  float yaw_deg = 0.0f;
+  uint32_t last_time_ms = 0;
   
   /* Main loop */
   while (1)
@@ -165,16 +172,31 @@ int main(void)
     /* Read IMU and stream data */
     if (g_imu_found)
     {
-      if (IMU_ReadRaw(&gyro_x, &gyro_y, &gyro_z))
+      if (IMU_ReadRaw(&gyro_x, &gyro_y, &gyro_z) && IMU_ReadAccel(&accel_x, &accel_y, &accel_z))
       {
         /* Convert raw gyro to degrees/sec (2000 dps range: raw_val * 2000/32768) */
         float gx_dps = (float)gyro_x * 2000.0f / 32768.0f;
         float gy_dps = (float)gyro_y * 2000.0f / 32768.0f;
         float gz_dps = (float)gyro_z * 2000.0f / 32768.0f;
         
-        /* Send gyro data as degrees/sec */
+        /* Calculate pitch/roll from accelerometer (atan2 of accel vectors) */
+        float ax_g = (float)accel_x / 2048.0f;  /* assuming ±16g range */
+        float ay_g = (float)accel_y / 2048.0f;
+        float az_g = (float)accel_z / 2048.0f;
+        
+        /* Pitch: rotation around Y axis, Roll: rotation around X axis */
+        roll_deg = atan2f(ay_g, az_g) * 180.0f / 3.14159265f;
+        pitch_deg = asinf(-ax_g) * 180.0f / 3.14159265f;
+        
+        /* Integrate yaw from Z-axis gyro (simple integration over 1 second) */
+        yaw_deg += gz_dps * 0.5f;  /* 500ms interval */
+        if (yaw_deg > 180.0f) yaw_deg -= 360.0f;
+        if (yaw_deg < -180.0f) yaw_deg += 360.0f;
+        
+        /* Send P/R/Y and gyro rates */
         int len = snprintf((char*)usb_buffer, sizeof(usb_buffer), 
-                          "Gx:%.1f Gy:%.1f Gz:%.1f dps\r\n",
+                          "P:%.1f R:%.1f Y:%.1f | Gx:%.1f Gy:%.1f Gz:%.1f dps\r\n",
+                          pitch_deg, roll_deg, yaw_deg,
                           gx_dps, gy_dps, gz_dps);
         if (len > 0 && len < (int)sizeof(usb_buffer)) {
           CDC_Transmit_FS(usb_buffer, (uint16_t)len);
