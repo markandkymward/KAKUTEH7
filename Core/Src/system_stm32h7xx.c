@@ -235,8 +235,8 @@ void SystemInit (void)
   /* Change the switch matrix read issuing capability to 1 for the AXI SRAM target (Target 7) */
   *((__IO uint32_t*)0x51008108) = 0x00000001U;
 
-  /* Startup delay - THIS GIVES DEBUGGER TIME TO ATTACH */
-  for (volatile uint32_t i = 0; i < 40000000UL; i++) { __asm__("nop"); }
+  /* Startup delay - REDUCED from 40M to 1M NOPs (~15ms debugger attach window) */
+  for (volatile uint32_t i = 0; i < 1000000UL; i++) { __asm__("nop"); }
 }
 
 /**

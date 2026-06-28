@@ -142,7 +142,7 @@ int main(void)
   
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_USB_DEVICE_Init();
+  /* MX_USB_DEVICE_Init(); */ /* USB disabled - no virtual COM yet */
   
   /* Main loop */
   while (1)
