@@ -690,14 +690,20 @@ static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax
   /* Roll = rotation around X axis (pitch forward -> positive) */
   float accel_roll = atan2f(ay_g, az_g) * 180.0f / 3.14159265f;
   
-  /* Complementary filter: 95% gyro integration + 5% accel correction */
+  /* Complementary filter: 85% gyro integration + 15% accel correction */
   /* dt = 0.5 seconds (500ms loop) */
   const float dt = 0.5f;
-  const float alpha = 0.05f;  /* weight of accel correction */
+  const float alpha = 0.15f;  /* weight of accel correction (increased for stability) */
   
   g_pitch_fused = (1.0f - alpha) * (g_pitch_fused + gy_dps * dt) + alpha * accel_pitch;
   g_roll_fused = (1.0f - alpha) * (g_roll_fused + gx_dps * dt) + alpha * accel_roll;
   g_yaw_fused += gz_dps * dt;  /* Yaw from gyro integration only (no absolute reference) */
+  
+  /* Clamp pitch/roll to ±90 degrees (physical limits for roll/pitch angles) */
+  if (g_pitch_fused > 90.0f) g_pitch_fused = 90.0f;
+  if (g_pitch_fused < -90.0f) g_pitch_fused = -90.0f;
+  if (g_roll_fused > 90.0f) g_roll_fused = 90.0f;
+  if (g_roll_fused < -90.0f) g_roll_fused = -90.0f;
   
   /* Constrain yaw to ±180 degrees */
   if (g_yaw_fused > 180.0f) g_yaw_fused -= 360.0f;
