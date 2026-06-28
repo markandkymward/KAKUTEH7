@@ -67,8 +67,7 @@ void MX_USB_DEVICE_Init(void)
 
   /* USER CODE END USB_DEVICE_Init_PreTreatment */
 
-  /* DISABLED: USB OTG requires PLL and complex USB PHY initialization */
-  /*
+  /* USB OTG now has PLL providing 48MHz USB clock - enable full init */
   if (USBD_Init(&hUsbDeviceFS, &FS_Desc, DEVICE_FS) != USBD_OK)
   {
     Error_Handler();
@@ -85,7 +84,6 @@ void MX_USB_DEVICE_Init(void)
   {
     Error_Handler();
   }
-  */
 
   /* USER CODE BEGIN USB_DEVICE_Init_PostTreatment */
   HAL_PWREx_EnableUSBVoltageDetector();
