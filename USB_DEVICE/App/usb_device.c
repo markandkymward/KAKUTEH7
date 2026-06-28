@@ -67,8 +67,7 @@ void MX_USB_DEVICE_Init(void)
 
   /* USER CODE END USB_DEVICE_Init_PreTreatment */
 
-  /* DISABLED: USB OTG core soft reset still hangs even with __HAL_RCC_USB_OTG_FS_CLK_ENABLE() */
-  /* Likely needs: USB PHY init, power domain config, or USB special clock setup */
+  /* DISABLED: USB OTG requires PLL and complex USB PHY initialization */
   /*
   if (USBD_Init(&hUsbDeviceFS, &FS_Desc, DEVICE_FS) != USBD_OK)
   {
