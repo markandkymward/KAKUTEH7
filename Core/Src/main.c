@@ -637,17 +637,17 @@ static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax
   float ay_g = (float)ay / 2048.0f;
   float az_g = (float)az / 2048.0f;
   
-  /* Calculate accel-only pitch/roll (static reference) */
-  float accel_roll = atan2f(ay_g, az_g) * 180.0f / 3.14159265f;
-  float accel_pitch = asinf(-ax_g) * 180.0f / 3.14159265f;
+  /* Calculate accel-only pitch/roll (static reference) - iNav/Betaflight convention */
+  float accel_pitch = atan2f(ay_g, az_g) * 180.0f / 3.14159265f;
+  float accel_roll = asinf(-ax_g) * 180.0f / 3.14159265f;
   
   /* Complementary filter: 98% gyro integration + 2% accel correction */
   /* dt = 0.5 seconds (500ms loop) */
   const float dt = 0.5f;
   const float alpha = 0.02f;  /* weight of accel correction */
   
-  g_roll_fused = (1.0f - alpha) * (g_roll_fused + gx_dps * dt) + alpha * accel_roll;
-  g_pitch_fused = (1.0f - alpha) * (g_pitch_fused + gy_dps * dt) + alpha * accel_pitch;
+  g_pitch_fused = (1.0f - alpha) * (g_pitch_fused + gx_dps * dt) + alpha * accel_pitch;
+  g_roll_fused = (1.0f - alpha) * (g_roll_fused + gy_dps * dt) + alpha * accel_roll;
   g_yaw_fused += gz_dps * dt;  /* Yaw from gyro integration only (no absolute reference) */
   
   /* Constrain yaw to ±180 degrees */
