@@ -167,11 +167,15 @@ int main(void)
     {
       if (IMU_ReadRaw(&gyro_x, &gyro_y, &gyro_z))
       {
-        /* Send IMU data: pitch, roll, yaw (centidegrees) */
+        /* Convert raw gyro to degrees/sec (2000 dps range: raw_val * 2000/32768) */
+        float gx_dps = (float)gyro_x * 2000.0f / 32768.0f;
+        float gy_dps = (float)gyro_y * 2000.0f / 32768.0f;
+        float gz_dps = (float)gyro_z * 2000.0f / 32768.0f;
+        
+        /* Send gyro data as degrees/sec */
         int len = snprintf((char*)usb_buffer, sizeof(usb_buffer), 
-                          "P:%ld R:%ld Y:%ld Gx:%d Gy:%d Gz:%d\r\n",
-                          g_pitch_cd, g_roll_cd, g_yaw_cd, 
-                          gyro_x, gyro_y, gyro_z);
+                          "Gx:%.1f Gy:%.1f Gz:%.1f dps\r\n",
+                          gx_dps, gy_dps, gz_dps);
         if (len > 0 && len < (int)sizeof(usb_buffer)) {
           CDC_Transmit_FS(usb_buffer, (uint16_t)len);
         }
