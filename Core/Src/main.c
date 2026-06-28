@@ -657,8 +657,8 @@ static void IMU_CalibrateLevel(void)
       float az_g = (float)az / 2048.0f;
       
       /* Calculate accel angles - use same formulas as main filter */
-      float accel_pitch = atan2f(-ay_g, -az_g) * 180.0f / 3.14159265f;
-      float accel_roll = atan2f(-ax_g, -az_g) * 180.0f / 3.14159265f;
+      float accel_pitch = atan2f(-az_g, -ay_g) * 180.0f / 3.14159265f;
+      float accel_roll = atan2f(-az_g, -ax_g) * 180.0f / 3.14159265f;
       
       sum_pitch += accel_pitch;
       sum_roll += accel_roll;
@@ -703,10 +703,19 @@ static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax
   float az_g = (float)az / 2048.0f;
   
   /* Calculate accel-only pitch/roll using atan2 for full range (no saturation) */
-  /* Pitch = rotation around X axis: atan2(-ay, -az), allows full ±180° range */
-  float accel_pitch = atan2f(-ay_g, -az_g) * 180.0f / 3.14159265f;
-  /* Roll = rotation around Y axis: atan2(-ax, -az), allows ±180° when inverted */
-  float accel_roll = atan2f(-ax_g, -az_g) * 180.0f / 3.14159265f;
+  /* Pitch = rotation around X axis */
+  float accel_pitch = atan2f(-az_g, -ay_g) * 180.0f / 3.14159265f;
+  /* Roll = rotation around Y axis */
+  float accel_roll = atan2f(-az_g, -ax_g) * 180.0f / 3.14159265f;
+  
+  /* DEBUG: Show what calibration thinks is level */
+  if (0) {  /* Set to 1 to enable debug */
+    uint8_t debug_buf[100];
+    int dlen = snprintf((char*)debug_buf, sizeof(debug_buf), 
+      "Raw: ax=%.2f ay=%.2f az=%.2f | CalcP=%.1f CalcR=%.1f\r\n",
+      ax_g, ay_g, az_g, accel_pitch, accel_roll);
+    if (dlen > 0) CDC_Transmit_FS(debug_buf, dlen);
+  }
   
   /* Complementary filter at 100Hz (dt = 0.01s) */
   /* Use low alpha (~0.05) since we update at 100Hz, most trust goes to gyro integration */
