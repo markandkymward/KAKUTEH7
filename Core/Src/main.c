@@ -656,9 +656,9 @@ static void IMU_CalibrateLevel(void)
       float ay_g = (float)ay / 2048.0f;
       float az_g = (float)az / 2048.0f;
       
-      /* Calculate accel angles */
-      float accel_pitch = atan2f(-ax_g, sqrtf(ay_g*ay_g + az_g*az_g)) * 180.0f / 3.14159265f;
-      float accel_roll = atan2f(ay_g, az_g) * 180.0f / 3.14159265f;
+      /* Calculate accel angles - use same formulas as main filter */
+      float accel_pitch = atan2f(ay_g, sqrtf(ax_g*ax_g + az_g*az_g)) * 180.0f / 3.14159265f;
+      float accel_roll = atan2f(ay_g, -az_g) * 180.0f / 3.14159265f;
       
       sum_pitch += accel_pitch;
       sum_roll += accel_roll;
