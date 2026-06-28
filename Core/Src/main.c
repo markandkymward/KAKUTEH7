@@ -136,17 +136,19 @@ int main(void)
 {
   /* MCU Configuration */
   HAL_Init();
-  SystemClock_Config();
+  /* SystemClock_Config(); */ /* Skipped - causes debugger disconnect. Using HSI clock as-is. */
   MPU_Config();
   
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   
-  /* Main loop - volatile marker prevents optimization */
-  volatile uint8_t keep_alive = 1U;
-  while (keep_alive)
+  /* Main loop */
+  while (1)
   {
-    __asm volatile("wfi");  /* Wait for interrupt, allows debugger in */
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_SET);
+    HAL_Delay(500);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_RESET);
+    HAL_Delay(500);
   }
   
   return 0;
