@@ -1,0 +1,30 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "GDB Remote: Attach (Manual Server)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Debug/KAKUTEH7.elf",
+            "cwd": "${workspaceFolder}",
+            "MIMode": "gdb",
+            "miDebuggerPath": "C:/Users/marka/AppData/Local/stm32cube/bundles/gnu-tools-for-stm32/14.3.1+st.2/bin/arm-none-eabi-gdb.exe",
+            "miDebuggerServerAddress": "localhost:50000",
+            "stopAtEntry": false,
+            "stopAtConnect": true,
+            "externalConsole": false,
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Halt the target",
+                    "text": "-exec-interrupt",
+                    "ignoreFailures": false
+                }
+            ]
+        }
+    ]
+}
