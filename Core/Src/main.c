@@ -223,9 +223,9 @@ int main(void)
         int gz_i = (int)gz_dps;
         int gz_f = (int)(fabsf(gz_dps - gz_i) * 10);
         
-        /* Fixed-width format with padding to ensure clean overwrite on same line */
+        /* Fixed-width format with ANSI clear-to-EOL to ensure clean overwrite on same line */
         int len = snprintf((char*)usb_buffer, sizeof(usb_buffer), 
-                          "\r[P:%+4d.%d R:%+4d.%d Y:%+4d.%d | Gx:%+4d.%d Gy:%+4d.%d Gz:%+4d.%d]     ",
+                          "\r\x1b[K[P:%+4d.%d R:%+4d.%d Y:%+4d.%d | Gx:%+4d.%d Gy:%+4d.%d Gz:%+4d.%d]",
                           pitch_i, pitch_f, roll_i, roll_f, yaw_i, yaw_f,
                           gx_i, gx_f, gy_i, gy_f, gz_i, gz_f);
         if (len > 0 && len < (int)sizeof(usb_buffer)) {
