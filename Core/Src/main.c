@@ -145,8 +145,15 @@ int main(void)
   MX_GPIO_Init();
   MX_USB_DEVICE_Init();
   
+  /* Initialize SPI for IMU */
+  MX_SPI4_Init();
+  
+  /* Probe for IMU sensor */
+  g_imu_found = IMU_Probe();
+  
   uint32_t counter = 0;
-  uint8_t usb_buffer[64];
+  uint8_t usb_buffer[128];
+  int16_t gyro_x, gyro_y, gyro_z;
   
   /* Main loop */
   while (1)
@@ -155,10 +162,30 @@ int main(void)
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_SET);
     HAL_Delay(500);
     
-    /* Send counter to USB */
-    int len = snprintf((char*)usb_buffer, sizeof(usb_buffer), "Counter: %lu\r\n", counter++);
-    if (len > 0 && len < (int)sizeof(usb_buffer)) {
-      CDC_Transmit_FS(usb_buffer, (uint16_t)len);
+    /* Read IMU and stream data */
+    if (g_imu_found)
+    {
+      if (IMU_ReadRaw(&gyro_x, &gyro_y, &gyro_z))
+      {
+        /* Send IMU data: pitch, roll, yaw (centidegrees) */
+        int len = snprintf((char*)usb_buffer, sizeof(usb_buffer), 
+                          "P:%ld R:%ld Y:%ld Gx:%d Gy:%d Gz:%d\r\n",
+                          g_pitch_cd, g_roll_cd, g_yaw_cd, 
+                          gyro_x, gyro_y, gyro_z);
+        if (len > 0 && len < (int)sizeof(usb_buffer)) {
+          CDC_Transmit_FS(usb_buffer, (uint16_t)len);
+        }
+      }
+    }
+    else
+    {
+      /* IMU not detected, stream error and counter instead */
+      int len = snprintf((char*)usb_buffer, sizeof(usb_buffer), 
+                        "IMU Error: 0x%04lX Counter: %lu\r\n", 
+                        g_imu_probe_error, counter++);
+      if (len > 0 && len < (int)sizeof(usb_buffer)) {
+        CDC_Transmit_FS(usb_buffer, (uint16_t)len);
+      }
     }
     
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_RESET);
