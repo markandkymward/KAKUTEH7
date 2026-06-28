@@ -671,9 +671,13 @@ static void IMU_CalibrateLevel(void)
   g_roll_fused = sum_roll / num_samples;
   g_yaw_fused = 0.0f;  /* Yaw always starts at 0 (no absolute reference) */
   
+  /* If very close to zero (within ±2 degrees), snap to exact zero to eliminate noise */
+  if (fabsf(g_pitch_fused) < 2.0f) g_pitch_fused = 0.0f;
+  if (fabsf(g_roll_fused) < 2.0f) g_roll_fused = 0.0f;
+  
   len = snprintf((char*)usb_buffer, sizeof(usb_buffer), 
-                "Level init: P:%.1f R:%.1f\r\n", 
-                g_pitch_fused, g_roll_fused);
+                "Level init: P:%.1f R:%.1f Y:%.1f\r\n", 
+                g_pitch_fused, g_roll_fused, g_yaw_fused);
   CDC_Transmit_FS(usb_buffer, len);
 }
 
