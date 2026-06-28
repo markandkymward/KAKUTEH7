@@ -210,18 +210,18 @@ int main(void)
         
         /* Send fused P/R/Y and corrected gyro rates (convert to fixed point for display) */
         int roll_i = (int)g_roll_fused;
-        int roll_f = (int)((g_roll_fused - roll_i) * 10);
+        int roll_f = (int)(fabsf(g_roll_fused - roll_i) * 10);
         int pitch_i = (int)g_pitch_fused;
-        int pitch_f = (int)((g_pitch_fused - pitch_i) * 10);
+        int pitch_f = (int)(fabsf(g_pitch_fused - pitch_i) * 10);
         int yaw_i = (int)g_yaw_fused;
-        int yaw_f = (int)((g_yaw_fused - yaw_i) * 10);
+        int yaw_f = (int)(fabsf(g_yaw_fused - yaw_i) * 10);
         
         int gx_i = (int)gx_dps;
-        int gx_f = (int)((gx_dps - gx_i) * 10);
+        int gx_f = (int)(fabsf(gx_dps - gx_i) * 10);
         int gy_i = (int)gy_dps;
-        int gy_f = (int)((gy_dps - gy_i) * 10);
+        int gy_f = (int)(fabsf(gy_dps - gy_i) * 10);
         int gz_i = (int)gz_dps;
-        int gz_f = (int)((gz_dps - gz_i) * 10);
+        int gz_f = (int)(fabsf(gz_dps - gz_i) * 10);
         
         /* Fixed-width format with padding to ensure clean overwrite on same line */
         int len = snprintf((char*)usb_buffer, sizeof(usb_buffer), 
