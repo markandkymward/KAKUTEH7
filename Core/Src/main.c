@@ -226,6 +226,14 @@ int main(void)
         int gz_i = (int)gz_dps;
         int gz_f = (int)(fabsf(gz_dps - gz_i) * 10);
         
+        /* Debug: show raw accel/gyro values */
+        uint8_t debug_buffer[128];
+        int debug_len = snprintf((char*)debug_buffer, sizeof(debug_buffer),
+                                "DEBUG| Ax:%6d Ay:%6d Az:%6d | Gx:%6d Gy:%6d Gz:%6d\r\n",
+                                accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z);
+        if (debug_len > 0) CDC_Transmit_FS(debug_buffer, debug_len);
+        HAL_Delay(10);  /* Small delay to ensure USB transmission */
+        
         /* Format data first, then use backspaces to move cursor to start */
         char data_str[100];
         int data_len = snprintf(data_str, sizeof(data_str), 
