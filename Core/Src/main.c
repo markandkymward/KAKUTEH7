@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include "usb_device.h"
+#include "usbd_cdc_if.h"
 
 /* USER CODE END Includes */
 
@@ -144,11 +145,22 @@ int main(void)
   MX_GPIO_Init();
   MX_USB_DEVICE_Init();
   
+  uint32_t counter = 0;
+  uint8_t usb_buffer[64];
+  
   /* Main loop */
   while (1)
   {
+    /* LED toggle */
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_SET);
     HAL_Delay(500);
+    
+    /* Send counter to USB */
+    int len = snprintf((char*)usb_buffer, sizeof(usb_buffer), "Counter: %lu\r\n", counter++);
+    if (len > 0 && len < (int)sizeof(usb_buffer)) {
+      CDC_Transmit_FS(usb_buffer, (uint16_t)len);
+    }
+    
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_RESET);
     HAL_Delay(500);
   }
