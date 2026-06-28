@@ -127,6 +127,7 @@ static void UART4_WriteString(const char *text);
 static void Debug_Attach_Window(void);
 static uint32_t Blink_Delay_Count(void);
 static void IMU_CalibrateGyro(void);
+static void IMU_CalibrateLevel(void);
 static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax, int16_t ay, int16_t az);
 /* USER CODE BEGIN PFP */
 
@@ -164,6 +165,8 @@ int main(void)
     IMU_Config();
     HAL_Delay(100);  /* Wait for config to settle */
     IMU_CalibrateGyro();  /* Calibrate gyro bias on level surface */
+    HAL_Delay(100);
+    IMU_CalibrateLevel();  /* Initialize pitch/roll from level position */
     HAL_Delay(500);  /* Extra delay after calibration */
   }
   
@@ -617,6 +620,50 @@ static void IMU_CalibrateGyro(void)
 }
 
 /**
+ * @brief Calibrate level position (initialize pitch/roll from accel)
+ * Reads accel for ~1 second on level surface to establish baseline angles
+ */
+static void IMU_CalibrateLevel(void)
+{
+  uint8_t usb_buffer[128];
+  int len = snprintf((char*)usb_buffer, sizeof(usb_buffer), "Calibrating level...\r\n");
+  CDC_Transmit_FS(usb_buffer, len);
+  
+  float sum_pitch = 0.0f, sum_roll = 0.0f;
+  int16_t ax, ay, az;
+  int num_samples = 100;
+  
+  for (int i = 0; i < num_samples; i++)
+  {
+    if (IMU_ReadAccel(&ax, &ay, &az))
+    {
+      /* Convert accel to g units (±16g range) */
+      float ax_g = (float)ax / 2048.0f;
+      float ay_g = (float)ay / 2048.0f;
+      float az_g = (float)az / 2048.0f;
+      
+      /* Calculate accel angles */
+      float accel_pitch = atan2f(-ax_g, sqrtf(ay_g*ay_g + az_g*az_g)) * 180.0f / 3.14159265f;
+      float accel_roll = atan2f(ay_g, az_g) * 180.0f / 3.14159265f;
+      
+      sum_pitch += accel_pitch;
+      sum_roll += accel_roll;
+    }
+    HAL_Delay(10);
+  }
+  
+  /* Initialize fused angles to accel baseline */
+  g_pitch_fused = sum_pitch / num_samples;
+  g_roll_fused = sum_roll / num_samples;
+  g_yaw_fused = 0.0f;  /* Yaw always starts at 0 (no absolute reference) */
+  
+  len = snprintf((char*)usb_buffer, sizeof(usb_buffer), 
+                "Level init: P:%.1f R:%.1f\r\n", 
+                g_pitch_fused, g_roll_fused);
+  CDC_Transmit_FS(usb_buffer, len);
+}
+
+/**
  * @brief Update Euler angles using complementary filter
  * Combines accelerometer (absolute reference) with gyro (fast response)
  */
@@ -637,14 +684,16 @@ static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax
   float ay_g = (float)ay / 2048.0f;
   float az_g = (float)az / 2048.0f;
   
-  /* Calculate accel-only pitch/roll (static reference) - iNav/Betaflight convention */
-  float accel_pitch = atan2f(ay_g, az_g) * 180.0f / 3.14159265f;
-  float accel_roll = asinf(-ax_g) * 180.0f / 3.14159265f;
+  /* Calculate accel-only pitch/roll using atan2 for full range (no saturation) */
+  /* Pitch = rotation around Y axis (roll right -> positive) */
+  float accel_pitch = atan2f(-ax_g, sqrtf(ay_g*ay_g + az_g*az_g)) * 180.0f / 3.14159265f;
+  /* Roll = rotation around X axis (pitch forward -> positive) */
+  float accel_roll = atan2f(ay_g, az_g) * 180.0f / 3.14159265f;
   
-  /* Complementary filter: 98% gyro integration + 2% accel correction */
+  /* Complementary filter: 95% gyro integration + 5% accel correction */
   /* dt = 0.5 seconds (500ms loop) */
   const float dt = 0.5f;
-  const float alpha = 0.02f;  /* weight of accel correction */
+  const float alpha = 0.05f;  /* weight of accel correction */
   
   g_pitch_fused = (1.0f - alpha) * (g_pitch_fused + gx_dps * dt) + alpha * accel_pitch;
   g_roll_fused = (1.0f - alpha) * (g_roll_fused + gy_dps * dt) + alpha * accel_roll;
