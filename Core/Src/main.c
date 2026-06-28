@@ -199,6 +199,9 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+
+  /* Enable USB OTG FS clock */
+  __HAL_RCC_USB_OTG_FS_CLK_ENABLE();
 }
 
 /**
