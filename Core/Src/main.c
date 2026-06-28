@@ -720,7 +720,17 @@ static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax
   /* Yaw integrates from gz (rotation about Z axis) - no accel correction */
   g_yaw_fused += gz_dps * dt;
   
-  /* Wrap yaw to ±180 degrees (pitch/roll naturally stay in ±90 due to atan2) */
+  /* Normalize pitch and roll to -180 to +180 range */
+  while (g_pitch_fused > 180.0f) g_pitch_fused -= 360.0f;
+  while (g_pitch_fused < -180.0f) g_pitch_fused += 360.0f;
+  while (g_roll_fused > 180.0f) g_roll_fused -= 360.0f;
+  while (g_roll_fused < -180.0f) g_roll_fused += 360.0f;
+  
+  /* Snap ±180° to 0° for pitch/roll (180° and 0° represent same orientation) */
+  if (fabsf(g_pitch_fused) > 175.0f) g_pitch_fused = 0.0f;
+  if (fabsf(g_roll_fused) > 175.0f) g_roll_fused = 0.0f;
+  
+  /* Wrap yaw to ±180 degrees */
   while (g_yaw_fused > 180.0f) g_yaw_fused -= 360.0f;
   while (g_yaw_fused < -180.0f) g_yaw_fused += 360.0f;
 }
