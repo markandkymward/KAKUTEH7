@@ -699,10 +699,10 @@ static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax
   float az_g = (float)az / 2048.0f;
   
   /* Calculate accel-only pitch/roll using atan2 for full range (no saturation) */
-  /* Pitch = rotation around X axis: atan2(ay, sqrt(ax² + az²)) */
+  /* Pitch = rotation around X axis: atan2(ay, sqrt(ax² + az²)), stays ±90° */
   float accel_pitch = atan2f(ay_g, sqrtf(ax_g*ax_g + az_g*az_g)) * 180.0f / 3.14159265f;
-  /* Roll = rotation around Y axis: atan2(ax, sqrt(ay² + az²)) */
-  float accel_roll = atan2f(ax_g, sqrtf(ay_g*ay_g + az_g*az_g)) * 180.0f / 3.14159265f;
+  /* Roll = rotation around Y axis: atan2(ay, -az), allows ±180° when inverted */
+  float accel_roll = atan2f(ay_g, -az_g) * 180.0f / 3.14159265f;
   
   /* Complementary filter at 100Hz (dt = 0.01s) */
   /* Use low alpha (~0.05) since we update at 100Hz, most trust goes to gyro integration */
