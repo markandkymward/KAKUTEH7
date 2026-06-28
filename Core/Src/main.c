@@ -693,9 +693,9 @@ static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax
   float az_g = (float)az / 2048.0f;
   
   /* Calculate accel-only pitch/roll using atan2 for full range (no saturation) */
-  /* Pitch = rotation around Y axis (roll right -> positive) */
+  /* Pitch = rotation around X axis (nose down -> negative pitch) */
   float accel_pitch = atan2f(-ax_g, sqrtf(ay_g*ay_g + az_g*az_g)) * 180.0f / 3.14159265f;
-  /* Roll = rotation around X axis (pitch forward -> positive) */
+  /* Roll = rotation around Y axis (right wing down -> positive roll) */
   float accel_roll = atan2f(ay_g, az_g) * 180.0f / 3.14159265f;
   
   /* Complementary filter: 85% gyro integration + 15% accel correction */
@@ -703,9 +703,12 @@ static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax
   const float dt = 0.5f;
   const float alpha = 0.15f;  /* weight of accel correction (increased for stability) */
   
-  g_pitch_fused = (1.0f - alpha) * (g_pitch_fused + gy_dps * dt) + alpha * accel_pitch;
-  g_roll_fused = (1.0f - alpha) * (g_roll_fused + gx_dps * dt) + alpha * accel_roll;
-  g_yaw_fused += gz_dps * dt;  /* Yaw from gyro integration only (no absolute reference) */
+  /* Pitch integrates from gx (rotation about X axis) */
+  g_pitch_fused = (1.0f - alpha) * (g_pitch_fused + gx_dps * dt) + alpha * accel_pitch;
+  /* Roll integrates from gy (rotation about Y axis) */
+  g_roll_fused = (1.0f - alpha) * (g_roll_fused + gy_dps * dt) + alpha * accel_roll;
+  /* Yaw integrates from gz (rotation about Z axis) */
+  g_yaw_fused += gz_dps * dt;
   
   /* Clamp pitch/roll to ±90 degrees (physical limits for roll/pitch angles) */
   if (g_pitch_fused > 90.0f) g_pitch_fused = 90.0f;
