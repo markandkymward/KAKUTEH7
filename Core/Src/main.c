@@ -695,8 +695,8 @@ static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax
   const float dt = 0.5f;
   const float alpha = 0.05f;  /* weight of accel correction */
   
-  g_pitch_fused = (1.0f - alpha) * (g_pitch_fused + gx_dps * dt) + alpha * accel_pitch;
-  g_roll_fused = (1.0f - alpha) * (g_roll_fused + gy_dps * dt) + alpha * accel_roll;
+  g_pitch_fused = (1.0f - alpha) * (g_pitch_fused + gy_dps * dt) + alpha * accel_pitch;
+  g_roll_fused = (1.0f - alpha) * (g_roll_fused + gx_dps * dt) + alpha * accel_roll;
   g_yaw_fused += gz_dps * dt;  /* Yaw from gyro integration only (no absolute reference) */
   
   /* Constrain yaw to ±180 degrees */
