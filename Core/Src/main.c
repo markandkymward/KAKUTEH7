@@ -100,12 +100,6 @@ static float g_roll_fused = 0.0f;
 static float g_pitch_fused = 0.0f;
 static float g_yaw_fused = 0.0f;
 
-/* Quaternion representation for sensor fusion (q0=w, q1=x, q2=y, q3=z) */
-static float g_q0 = 1.0f;  /* w */
-static float g_q1 = 0.0f;  /* x */
-static float g_q2 = 0.0f;  /* y */
-static float g_q3 = 0.0f;  /* z */
-
 static uint8_t g_imu_spi_mode = 3U; /* 3=mode3, 0=mode0 */
 
 /* USER CODE END PV */
@@ -135,9 +129,6 @@ static uint32_t Blink_Delay_Count(void);
 static void IMU_CalibrateGyro(void);
 static void IMU_CalibrateLevel(void);
 static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax, int16_t ay, int16_t az);
-static void Quat_Normalize(float *q0, float *q1, float *q2, float *q3);
-static void Quat_GetEuler(float q0, float q1, float q2, float q3, float *roll, float *pitch, float *yaw);
-static void Quat_IntegrateGyro(float *q0, float *q1, float *q2, float *q3, float gx, float gy, float gz, float dt);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -690,65 +681,6 @@ static void IMU_CalibrateLevel(void)
  * @brief Update Euler angles using complementary filter
  * Combines accelerometer (absolute reference) with gyro (fast response)
  */
-/**
-  * @brief Normalize a quaternion to unit magnitude
-  */
-static void Quat_Normalize(float *q0, float *q1, float *q2, float *q3)
-{
-  float norm = sqrtf((*q0)*(*q0) + (*q1)*(*q1) + (*q2)*(*q2) + (*q3)*(*q3));
-  if (norm < 0.0001f) norm = 1.0f;
-  *q0 /= norm;
-  *q1 /= norm;
-  *q2 /= norm;
-  *q3 /= norm;
-}
-
-/**
-  * @brief Extract Euler angles from quaternion (in degrees)
-  */
-static void Quat_GetEuler(float q0, float q1, float q2, float q3, float *roll, float *pitch, float *yaw)
-{
-  const float DEG_PER_RAD = 180.0f / 3.14159265f;
-  
-  /* Roll (X-axis rotation) */
-  float sinr_cosp = 2.0f * (q0*q1 + q2*q3);
-  float cosr_cosp = 1.0f - 2.0f * (q1*q1 + q2*q2);
-  *roll = atan2f(sinr_cosp, cosr_cosp) * DEG_PER_RAD;
-  
-  /* Pitch (Y-axis rotation) */
-  float sinp = 2.0f * (q0*q2 - q3*q1);
-  if (fabsf(sinp) >= 1.0f)
-    *pitch = copysignf(90.0f, sinp);
-  else
-    *pitch = asinf(sinp) * DEG_PER_RAD;
-  
-  /* Yaw (Z-axis rotation) */
-  float siny_cosp = 2.0f * (q0*q3 + q1*q2);
-  float cosy_cosp = 1.0f - 2.0f * (q2*q2 + q3*q3);
-  *yaw = atan2f(siny_cosp, cosy_cosp) * DEG_PER_RAD;
-}
-
-/**
-  * @brief Integrate gyro rates into quaternion (small angle approximation)
-  * @param dt: timestep in seconds
-  */
-static void Quat_IntegrateGyro(float *q0, float *q1, float *q2, float *q3, float gx, float gy, float gz, float dt)
-{
-  /* Quaternion update from gyro: q_new = q_old * (1, 0.5*wx*dt, 0.5*wy*dt, 0.5*wz*dt) */
-  float half_dt = 0.5f * dt;
-  float q0_new = *q0 - half_dt * ((*q1)*gx + (*q2)*gy + (*q3)*gz);
-  float q1_new = *q1 + half_dt * ((*q0)*gx - (*q3)*gy + (*q2)*gz);
-  float q2_new = *q2 + half_dt * ((*q3)*gx + (*q0)*gy - (*q1)*gz);
-  float q3_new = *q3 - half_dt * ((*q2)*gx - (*q1)*gy + (*q0)*gz);
-  
-  *q0 = q0_new;
-  *q1 = q1_new;
-  *q2 = q2_new;
-  *q3 = q3_new;
-  
-  Quat_Normalize(q0, q1, q2, q3);
-}
-
 static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax, int16_t ay, int16_t az)
 {
   /* Apply gyro bias correction */
@@ -756,48 +688,37 @@ static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax
   int16_t gy_corrected = gy - (int16_t)g_gyro_bias_y;
   int16_t gz_corrected = gz - (int16_t)g_gyro_bias_z;
   
-  /* Convert gyro to radians/sec (2000 dps range) */
-  float gx_rad = (float)gx_corrected * (2000.0f * 3.14159265f / 180.0f) / 32768.0f;
-  float gy_rad = (float)gy_corrected * (2000.0f * 3.14159265f / 180.0f) / 32768.0f;
-  float gz_rad = (float)gz_corrected * (2000.0f * 3.14159265f / 180.0f) / 32768.0f;
+  /* Convert gyro to degrees/sec (2000 dps range) */
+  float gx_dps = (float)gx_corrected * 2000.0f / 32768.0f;
+  float gy_dps = (float)gy_corrected * 2000.0f / 32768.0f;
+  float gz_dps = (float)gz_corrected * 2000.0f / 32768.0f;
   
   /* Convert accel to g units (±16g range) */
   float ax_g = (float)ax / 2048.0f;
   float ay_g = (float)ay / 2048.0f;
   float az_g = (float)az / 2048.0f;
   
-  /* Calculate accel-based quaternion (only pitch/roll from accel, yaw from gyro) */
-  float accel_pitch = atan2f(ay_g, sqrtf(ax_g*ax_g + az_g*az_g));
-  float accel_roll = atan2f(ax_g, sqrtf(ay_g*ay_g + az_g*az_g));
+  /* Calculate accel-only pitch/roll using atan2 for full range (no saturation) */
+  /* Pitch = rotation around X axis: atan2(ay, sqrt(ax² + az²)) */
+  float accel_pitch = atan2f(ay_g, sqrtf(ax_g*ax_g + az_g*az_g)) * 180.0f / 3.14159265f;
+  /* Roll = rotation around Y axis: atan2(ax, sqrt(ay² + az²)) */
+  float accel_roll = atan2f(ax_g, sqrtf(ay_g*ay_g + az_g*az_g)) * 180.0f / 3.14159265f;
   
-  /* Convert accel pitch/roll to quaternion (yaw from gyro accumulation) */
-  float q_accel_0 = cosf(accel_roll * 0.5f) * cosf(accel_pitch * 0.5f);
-  float q_accel_1 = sinf(accel_roll * 0.5f) * cosf(accel_pitch * 0.5f);
-  float q_accel_2 = cosf(accel_roll * 0.5f) * sinf(accel_pitch * 0.5f);
-  float q_accel_3 = sinf(accel_roll * 0.5f) * sinf(accel_pitch * 0.5f);
-  
-  /* Timestep: 10ms loop (0.01s) */
+  /* Complementary filter at 100Hz (dt = 0.01s) */
+  /* Use low alpha (~0.05) since we update at 100Hz, most trust goes to gyro integration */
   const float dt = 0.01f;
+  const float alpha = 0.05f;  /* 5% accel, 95% gyro (tuned for 100Hz) */
   
-  /* Integrate gyro into quaternion */
-  Quat_IntegrateGyro(&g_q0, &g_q1, &g_q2, &g_q3, gx_rad, gy_rad, gz_rad, dt);
+  /* Pitch integrates from gx (rotation about X axis) */
+  g_pitch_fused = (1.0f - alpha) * (g_pitch_fused + gx_dps * dt) + alpha * accel_pitch;
+  /* Roll integrates from gy (rotation about Y axis) */
+  g_roll_fused = (1.0f - alpha) * (g_roll_fused + gy_dps * dt) + alpha * accel_roll;
+  /* Yaw integrates from gz (rotation about Z axis) - no accel correction */
+  g_yaw_fused += gz_dps * dt;
   
-  /* Complementary filter: LERP quaternions (alpha=0.02 for 100Hz, ~0.98 gyro, 0.02 accel) */
-  const float alpha = 0.02f;
-  float q0_blend = (1.0f - alpha) * g_q0 + alpha * q_accel_0;
-  float q1_blend = (1.0f - alpha) * g_q1 + alpha * q_accel_1;
-  float q2_blend = (1.0f - alpha) * g_q2 + alpha * q_accel_2;
-  float q3_blend = (1.0f - alpha) * g_q3 + alpha * q_accel_3;
-  
-  Quat_Normalize(&q0_blend, &q1_blend, &q2_blend, &q3_blend);
-  
-  g_q0 = q0_blend;
-  g_q1 = q1_blend;
-  g_q2 = q2_blend;
-  g_q3 = q3_blend;
-  
-  /* Extract Euler angles from final quaternion */
-  Quat_GetEuler(g_q0, g_q1, g_q2, g_q3, &g_roll_fused, &g_pitch_fused, &g_yaw_fused);
+  /* Wrap yaw to ±180 degrees (pitch/roll naturally stay in ±90 due to atan2) */
+  while (g_yaw_fused > 180.0f) g_yaw_fused -= 360.0f;
+  while (g_yaw_fused < -180.0f) g_yaw_fused += 360.0f;
 }
 
 static uint8_t IMU_ReadRaw(int16_t *gx, int16_t *gy, int16_t *gz)
