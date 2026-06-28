@@ -67,8 +67,7 @@ void MX_USB_DEVICE_Init(void)
 
   /* USER CODE END USB_DEVICE_Init_PreTreatment */
 
-  /* DISABLED: USB OTG requires full PLL setup which risks debugger stability */
-  /* Deferred for future work */
+  /* DISABLED: USB OTG requires PLL and complex USB PHY initialization */
   /*
   if (USBD_Init(&hUsbDeviceFS, &FS_Desc, DEVICE_FS) != USBD_OK)
   {
