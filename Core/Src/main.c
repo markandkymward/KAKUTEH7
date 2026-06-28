@@ -734,10 +734,10 @@ static uint8_t IMU_ReadRaw(int16_t *gx, int16_t *gy, int16_t *gz)
     return 0U;
   }
 
-  /* BMI270 outputs little-endian: low byte first, then high byte */
-  *gx = (int16_t)((int16_t)data[1] << 8 | data[0]);
-  *gy = (int16_t)((int16_t)data[3] << 8 | data[2]);
-  *gz = (int16_t)((int16_t)data[5] << 8 | data[4]);
+  /* BMI270 uses big-endian: high byte first, then low byte */
+  *gx = (int16_t)((((uint16_t)data[0]) << 8) | (uint16_t)data[1]);
+  *gy = (int16_t)((((uint16_t)data[2]) << 8) | (uint16_t)data[3]);
+  *gz = (int16_t)((((uint16_t)data[4]) << 8) | (uint16_t)data[5]);
   return 1U;
 }
 
@@ -756,10 +756,10 @@ static uint8_t IMU_ReadAccel(int16_t *ax, int16_t *ay, int16_t *az)
     return 0U;
   }
 
-  /* BMI270 outputs little-endian: low byte first, then high byte */
-  *ax = (int16_t)((int16_t)data[1] << 8 | data[0]);
-  *ay = (int16_t)((int16_t)data[3] << 8 | data[2]);
-  *az = (int16_t)((int16_t)data[5] << 8 | data[4]);
+  /* BMI270 uses big-endian: high byte first, then low byte */
+  *ax = (int16_t)((((uint16_t)data[0]) << 8) | (uint16_t)data[1]);
+  *ay = (int16_t)((((uint16_t)data[2]) << 8) | (uint16_t)data[3]);
+  *az = (int16_t)((((uint16_t)data[4]) << 8) | (uint16_t)data[5]);
   return 1U;
 }
 
