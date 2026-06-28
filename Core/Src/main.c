@@ -95,6 +95,11 @@ static int32_t g_gyro_bias_y = 0;
 static int32_t g_gyro_bias_z = 0;
 static uint8_t g_gyro_calibrated = 0U;
 
+/* Fused Euler angles from complementary filter */
+static float g_roll_fused = 0.0f;
+static float g_pitch_fused = 0.0f;
+static float g_yaw_fused = 0.0f;
+
 static uint8_t g_imu_spi_mode = 3U; /* 3=mode3, 0=mode0 */
 
 /* USER CODE END PV */
@@ -121,6 +126,8 @@ static void MX_UART4_Init(void);
 static void UART4_WriteString(const char *text);
 static void Debug_Attach_Window(void);
 static uint32_t Blink_Delay_Count(void);
+static void IMU_CalibrateGyro(void);
+static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax, int16_t ay, int16_t az);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -151,6 +158,15 @@ int main(void)
   /* Probe for IMU sensor */
   g_imu_found = IMU_Probe();
   
+  /* If IMU found, initialize and calibrate it */
+  if (g_imu_found)
+  {
+    IMU_Config();
+    HAL_Delay(100);  /* Wait for config to settle */
+    IMU_CalibrateGyro();  /* Calibrate gyro bias on level surface */
+    HAL_Delay(500);  /* Extra delay after calibration */
+  }
+  
   uint32_t counter = 0;
   uint8_t usb_buffer[128];
   int16_t gyro_x, gyro_y, gyro_z;
@@ -162,6 +178,16 @@ int main(void)
   float yaw_deg = 0.0f;
   uint32_t last_time_ms = 0;
   
+  /* Wait for USB to enumerate and print startup message */
+  HAL_Delay(1000);
+  
+  int len = snprintf((char*)usb_buffer, sizeof(usb_buffer),
+                    "IMU Status: Found=%d WhoAmI=0x%02X Mode=%d Err=0x%04lX\r\n",
+                    g_imu_found, g_imu_whoami, g_imu_spi_mode, g_imu_probe_error);
+  if (len > 0 && len < (int)sizeof(usb_buffer)) {
+    CDC_Transmit_FS(usb_buffer, (uint16_t)len);
+  }
+  
   /* Main loop */
   while (1)
   {
@@ -172,32 +198,60 @@ int main(void)
     /* Read IMU and stream data */
     if (g_imu_found)
     {
-      if (IMU_ReadRaw(&gyro_x, &gyro_y, &gyro_z) && IMU_ReadAccel(&accel_x, &accel_y, &accel_z))
+      uint8_t gyro_ok = IMU_ReadRaw(&gyro_x, &gyro_y, &gyro_z);
+      uint8_t accel_ok = IMU_ReadAccel(&accel_x, &accel_y, &accel_z);
+      
+      /* Send diagnostic info */
+      int len = snprintf((char*)usb_buffer, sizeof(usb_buffer), 
+                        "GyroOk=%d(%d,%d,%d) AccelOk=%d(%d,%d,%d)\r\n",
+                        gyro_ok, gyro_x, gyro_y, gyro_z,
+                        accel_ok, accel_x, accel_y, accel_z);
+      if (len > 0 && len < (int)sizeof(usb_buffer)) {
+        CDC_Transmit_FS(usb_buffer, (uint16_t)len);
+      }
+      
+      if (gyro_ok && accel_ok)
       {
-        /* Convert raw gyro to degrees/sec (2000 dps range: raw_val * 2000/32768) */
-        float gx_dps = (float)gyro_x * 2000.0f / 32768.0f;
-        float gy_dps = (float)gyro_y * 2000.0f / 32768.0f;
-        float gz_dps = (float)gyro_z * 2000.0f / 32768.0f;
+        /* Update fused Euler angles using complementary filter */
+        IMU_UpdateEulerAngles(gyro_x, gyro_y, gyro_z, accel_x, accel_y, accel_z);
         
-        /* Calculate pitch/roll from accelerometer (atan2 of accel vectors) */
-        float ax_g = (float)accel_x / 2048.0f;  /* assuming ±16g range */
-        float ay_g = (float)accel_y / 2048.0f;
-        float az_g = (float)accel_z / 2048.0f;
+        /* Convert raw gyro to degrees/sec for display (apply bias correction) */
+        int16_t gx_corrected = gyro_x - (int16_t)g_gyro_bias_x;
+        int16_t gy_corrected = gyro_y - (int16_t)g_gyro_bias_y;
+        int16_t gz_corrected = gyro_z - (int16_t)g_gyro_bias_z;
         
-        /* Pitch: rotation around Y axis, Roll: rotation around X axis */
-        roll_deg = atan2f(ay_g, az_g) * 180.0f / 3.14159265f;
-        pitch_deg = asinf(-ax_g) * 180.0f / 3.14159265f;
+        float gx_dps = (float)gx_corrected * 2000.0f / 32768.0f;
+        float gy_dps = (float)gy_corrected * 2000.0f / 32768.0f;
+        float gz_dps = (float)gz_corrected * 2000.0f / 32768.0f;
         
-        /* Integrate yaw from Z-axis gyro (simple integration over 1 second) */
-        yaw_deg += gz_dps * 0.5f;  /* 500ms interval */
-        if (yaw_deg > 180.0f) yaw_deg -= 360.0f;
-        if (yaw_deg < -180.0f) yaw_deg += 360.0f;
+        /* Send fused P/R/Y and corrected gyro rates (convert to fixed point for display) */
+        int roll_i = (int)g_roll_fused;
+        int roll_f = (int)((g_roll_fused - roll_i) * 10);
+        int pitch_i = (int)g_pitch_fused;
+        int pitch_f = (int)((g_pitch_fused - pitch_i) * 10);
+        int yaw_i = (int)g_yaw_fused;
+        int yaw_f = (int)((g_yaw_fused - yaw_i) * 10);
         
-        /* Send P/R/Y and gyro rates */
+        int gx_i = (int)gx_dps;
+        int gx_f = (int)((gx_dps - gx_i) * 10);
+        int gy_i = (int)gy_dps;
+        int gy_f = (int)((gy_dps - gy_i) * 10);
+        int gz_i = (int)gz_dps;
+        int gz_f = (int)((gz_dps - gz_i) * 10);
+        
         int len = snprintf((char*)usb_buffer, sizeof(usb_buffer), 
-                          "P:%.1f R:%.1f Y:%.1f | Gx:%.1f Gy:%.1f Gz:%.1f dps\r\n",
-                          pitch_deg, roll_deg, yaw_deg,
-                          gx_dps, gy_dps, gz_dps);
+                          "P:%d.%d R:%d.%d Y:%d.%d | Gx:%d.%d Gy:%d.%d Gz:%d.%d\r\n",
+                          pitch_i, pitch_f, roll_i, roll_f, yaw_i, yaw_f,
+                          gx_i, gx_f, gy_i, gy_f, gz_i, gz_f);
+        if (len > 0 && len < (int)sizeof(usb_buffer)) {
+          CDC_Transmit_FS(usb_buffer, (uint16_t)len);
+        }
+      }
+      else
+      {
+        len = snprintf((char*)usb_buffer, sizeof(usb_buffer), 
+                          "IMU Read Error: Gyro=%d Accel=%d Err=0x%04lX\r\n",
+                          gyro_ok, accel_ok, g_imu_probe_error);
         if (len > 0 && len < (int)sizeof(usb_buffer)) {
           CDC_Transmit_FS(usb_buffer, (uint16_t)len);
         }
@@ -498,20 +552,35 @@ static uint8_t IMU_WriteReg(uint8_t reg, uint8_t value)
 
 static uint8_t IMU_ReadBurst(uint8_t startReg, uint8_t *data, uint8_t len)
 {
+  uint8_t tmp_diag[128];
+  
   if ((data == NULL) || (len == 0U))
   {
     return 0U;
   }
 
   HAL_GPIO_WritePin(IMU_CS_PORT, IMU_CS_PIN, GPIO_PIN_RESET);
-  (void)IMU_SpiTransfer((uint8_t)(startReg | 0x80U));
+  IMU_SpiDelay();  /* Ensure CS is settled before first transfer */
+  
+  uint8_t addr_echo = IMU_SpiTransfer((uint8_t)(startReg | 0x80U));
+  IMU_SpiDelay();  /* Allow IMU to respond */
+  
+  int diag_len = snprintf((char*)tmp_diag, sizeof(tmp_diag), 
+                         "Addr=0x%02X Echo=0x%02X ", startReg, addr_echo);
 
   for (uint8_t i = 0U; i < len; i++)
   {
     data[i] = IMU_SpiTransfer(0x00U);
+    IMU_SpiDelay();  /* Brief delay between bytes */
   }
 
+  diag_len += snprintf((char*)(tmp_diag + diag_len), sizeof(tmp_diag) - diag_len,
+                       "Data=%02X %02X %02X %02X %02X %02X\r\n",
+                       data[0], data[1], data[2], data[3], data[4], data[5]);
+  CDC_Transmit_FS(tmp_diag, diag_len);
+
   HAL_GPIO_WritePin(IMU_CS_PORT, IMU_CS_PIN, GPIO_PIN_SET);
+  IMU_SpiDelay();  /* Ensure CS is settled before release */
   return 1U;
 }
 
@@ -540,6 +609,79 @@ static uint8_t IMU_Config(void)
   return 1U;
 }
 
+/**
+ * @brief Calibrate gyro by averaging 100 readings while board is stationary
+ */
+static void IMU_CalibrateGyro(void)
+{
+  uint8_t usb_buffer[128];
+  int len = snprintf((char*)usb_buffer, sizeof(usb_buffer), "Calibrating gyro...\r\n");
+  CDC_Transmit_FS(usb_buffer, len);
+  
+  int32_t sum_gx = 0, sum_gy = 0, sum_gz = 0;
+  int16_t gx, gy, gz;
+  
+  for (int i = 0; i < 100; i++)
+  {
+    if (IMU_ReadRaw(&gx, &gy, &gz))
+    {
+      sum_gx += gx;
+      sum_gy += gy;
+      sum_gz += gz;
+    }
+    HAL_Delay(10);
+  }
+  
+  g_gyro_bias_x = sum_gx / 100;
+  g_gyro_bias_y = sum_gy / 100;
+  g_gyro_bias_z = sum_gz / 100;
+  g_gyro_calibrated = 1U;
+  
+  len = snprintf((char*)usb_buffer, sizeof(usb_buffer), 
+                "Gyro biases: %ld %ld %ld\r\n", 
+                g_gyro_bias_x, g_gyro_bias_y, g_gyro_bias_z);
+  CDC_Transmit_FS(usb_buffer, len);
+}
+
+/**
+ * @brief Update Euler angles using complementary filter
+ * Combines accelerometer (absolute reference) with gyro (fast response)
+ */
+static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax, int16_t ay, int16_t az)
+{
+  /* Apply gyro bias correction */
+  int16_t gx_corrected = gx - (int16_t)g_gyro_bias_x;
+  int16_t gy_corrected = gy - (int16_t)g_gyro_bias_y;
+  int16_t gz_corrected = gz - (int16_t)g_gyro_bias_z;
+  
+  /* Convert gyro to degrees/sec (2000 dps range) */
+  float gx_dps = (float)gx_corrected * 2000.0f / 32768.0f;
+  float gy_dps = (float)gy_corrected * 2000.0f / 32768.0f;
+  float gz_dps = (float)gz_corrected * 2000.0f / 32768.0f;
+  
+  /* Convert accel to g units (±16g range) */
+  float ax_g = (float)ax / 2048.0f;
+  float ay_g = (float)ay / 2048.0f;
+  float az_g = (float)az / 2048.0f;
+  
+  /* Calculate accel-only pitch/roll (static reference) */
+  float accel_roll = atan2f(ay_g, az_g) * 180.0f / 3.14159265f;
+  float accel_pitch = asinf(-ax_g) * 180.0f / 3.14159265f;
+  
+  /* Complementary filter: 98% gyro integration + 2% accel correction */
+  /* dt = 0.5 seconds (500ms loop) */
+  const float dt = 0.5f;
+  const float alpha = 0.02f;  /* weight of accel correction */
+  
+  g_roll_fused = (1.0f - alpha) * (g_roll_fused + gx_dps * dt) + alpha * accel_roll;
+  g_pitch_fused = (1.0f - alpha) * (g_pitch_fused + gy_dps * dt) + alpha * accel_pitch;
+  g_yaw_fused += gz_dps * dt;  /* Yaw from gyro integration only (no absolute reference) */
+  
+  /* Constrain yaw to ±180 degrees */
+  if (g_yaw_fused > 180.0f) g_yaw_fused -= 360.0f;
+  if (g_yaw_fused < -180.0f) g_yaw_fused += 360.0f;
+}
+
 static uint8_t IMU_ReadRaw(int16_t *gx, int16_t *gy, int16_t *gz)
 {
   uint8_t data[6];
@@ -559,6 +701,16 @@ static uint8_t IMU_ReadRaw(int16_t *gx, int16_t *gy, int16_t *gz)
   *gx = (int16_t)((((uint16_t)data[0]) << 8) | (uint16_t)data[1]);
   *gy = (int16_t)((((uint16_t)data[2]) << 8) | (uint16_t)data[3]);
   *gz = (int16_t)((((uint16_t)data[4]) << 8) | (uint16_t)data[5]);
+  
+  /* Debug: log raw bytes */
+  static uint32_t debug_count = 0;
+  if ((debug_count++ % 20) == 0) {
+    uint8_t tmp[128];
+    int len = snprintf((char*)tmp, sizeof(tmp), "GyroBytesRaw: %02X %02X %02X %02X %02X %02X\r\n",
+                      data[0], data[1], data[2], data[3], data[4], data[5]);
+    CDC_Transmit_FS(tmp, len);
+  }
+  
   return 1U;
 }
 
@@ -612,7 +764,8 @@ static uint8_t IMU_SpiTransferMode3(uint8_t tx)
 
 static void IMU_SpiDelay(void)
 {
-  for (volatile uint32_t i = 0U; i < 10U; i++)
+  /* Provide ~1 microsecond delay (10 NOPs was too fast at 120 MHz) */
+  for (volatile uint32_t i = 0U; i < 1000U; i++)
   {
     __NOP();
   }
