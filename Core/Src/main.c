@@ -223,12 +223,29 @@ int main(void)
         int gz_i = (int)gz_dps;
         int gz_f = (int)(fabsf(gz_dps - gz_i) * 10);
         
-        /* Fixed-width format with ANSI clear-to-EOL to ensure clean overwrite on same line */
-        int len = snprintf((char*)usb_buffer, sizeof(usb_buffer), 
-                          "\r\x1b[K[P:%+4d.%d R:%+4d.%d Y:%+4d.%d | Gx:%+4d.%d Gy:%+4d.%d Gz:%+4d.%d]",
-                          pitch_i, pitch_f, roll_i, roll_f, yaw_i, yaw_f,
-                          gx_i, gx_f, gy_i, gy_f, gz_i, gz_f);
-        if (len > 0 && len < (int)sizeof(usb_buffer)) {
+        /* Format data first, then use backspaces to move cursor to start */
+        char data_str[100];
+        int data_len = snprintf(data_str, sizeof(data_str), 
+                               "[P:%+4d.%d R:%+4d.%d Y:%+4d.%d | Gx:%+4d.%d Gy:%+4d.%d Gz:%+4d.%d]",
+                               pitch_i, pitch_f, roll_i, roll_f, yaw_i, yaw_f,
+                               gx_i, gx_f, gy_i, gy_f, gz_i, gz_f);
+        
+        /* Build output with backspaces to move cursor back */
+        int len = 0;
+        uint8_t *ptr = usb_buffer;
+        
+        /* Fill first part with backspaces (or skip on first iteration) */
+        if (data_len > 0 && data_len < 100) {
+          for (int i = 0; i < data_len && len < (int)sizeof(usb_buffer) - 1; i++) {
+            ptr[len++] = '\b';  /* backspace character */
+          }
+          /* Copy data string */
+          for (int i = 0; i < data_len && len < (int)sizeof(usb_buffer) - 1; i++) {
+            ptr[len++] = data_str[i];
+          }
+        }
+        
+        if (len > 0) {
           CDC_Transmit_FS(usb_buffer, (uint16_t)len);
         }
       }
