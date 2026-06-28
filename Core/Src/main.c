@@ -675,6 +675,10 @@ static void IMU_CalibrateLevel(void)
   if (fabsf(g_pitch_fused) < 2.0f) g_pitch_fused = 0.0f;
   if (fabsf(g_roll_fused) < 2.0f) g_roll_fused = 0.0f;
   
+  /* Also snap to zero if at wraparound (±180°), since 180° and 0° are the same */
+  if (fabsf(g_pitch_fused) > 178.0f) g_pitch_fused = 0.0f;
+  if (fabsf(g_roll_fused) > 178.0f) g_roll_fused = 0.0f;
+  
   len = snprintf((char*)usb_buffer, sizeof(usb_buffer), 
                 "Level init: P:%.1f R:%.1f Y:%.1f\r\n", 
                 g_pitch_fused, g_roll_fused, g_yaw_fused);
