@@ -178,15 +178,8 @@ int main(void)
   float yaw_deg = 0.0f;
   uint32_t last_time_ms = 0;
   
-  /* Wait for USB to enumerate and print startup message */
+  /* Wait for USB to enumerate */
   HAL_Delay(1000);
-  
-  int len = snprintf((char*)usb_buffer, sizeof(usb_buffer),
-                    "IMU Status: Found=%d WhoAmI=0x%02X Mode=%d Err=0x%04lX\r\n",
-                    g_imu_found, g_imu_whoami, g_imu_spi_mode, g_imu_probe_error);
-  if (len > 0 && len < (int)sizeof(usb_buffer)) {
-    CDC_Transmit_FS(usb_buffer, (uint16_t)len);
-  }
   
   /* Main loop */
   while (1)
@@ -200,15 +193,6 @@ int main(void)
     {
       uint8_t gyro_ok = IMU_ReadRaw(&gyro_x, &gyro_y, &gyro_z);
       uint8_t accel_ok = IMU_ReadAccel(&accel_x, &accel_y, &accel_z);
-      
-      /* Send diagnostic info */
-      int len = snprintf((char*)usb_buffer, sizeof(usb_buffer), 
-                        "GyroOk=%d(%d,%d,%d) AccelOk=%d(%d,%d,%d)\r\n",
-                        gyro_ok, gyro_x, gyro_y, gyro_z,
-                        accel_ok, accel_x, accel_y, accel_z);
-      if (len > 0 && len < (int)sizeof(usb_buffer)) {
-        CDC_Transmit_FS(usb_buffer, (uint16_t)len);
-      }
       
       if (gyro_ok && accel_ok)
       {
@@ -240,31 +224,12 @@ int main(void)
         int gz_f = (int)((gz_dps - gz_i) * 10);
         
         int len = snprintf((char*)usb_buffer, sizeof(usb_buffer), 
-                          "P:%d.%d R:%d.%d Y:%d.%d | Gx:%d.%d Gy:%d.%d Gz:%d.%d\r\n",
+                          "\rP:%d.%d R:%d.%d Y:%d.%d | Gx:%d.%d Gy:%d.%d Gz:%d.%d",
                           pitch_i, pitch_f, roll_i, roll_f, yaw_i, yaw_f,
                           gx_i, gx_f, gy_i, gy_f, gz_i, gz_f);
         if (len > 0 && len < (int)sizeof(usb_buffer)) {
           CDC_Transmit_FS(usb_buffer, (uint16_t)len);
         }
-      }
-      else
-      {
-        len = snprintf((char*)usb_buffer, sizeof(usb_buffer), 
-                          "IMU Read Error: Gyro=%d Accel=%d Err=0x%04lX\r\n",
-                          gyro_ok, accel_ok, g_imu_probe_error);
-        if (len > 0 && len < (int)sizeof(usb_buffer)) {
-          CDC_Transmit_FS(usb_buffer, (uint16_t)len);
-        }
-      }
-    }
-    else
-    {
-      /* IMU not detected, stream error and counter instead */
-      int len = snprintf((char*)usb_buffer, sizeof(usb_buffer), 
-                        "IMU Error: 0x%04lX Counter: %lu\r\n", 
-                        g_imu_probe_error, counter++);
-      if (len > 0 && len < (int)sizeof(usb_buffer)) {
-        CDC_Transmit_FS(usb_buffer, (uint16_t)len);
       }
     }
     
@@ -552,8 +517,6 @@ static uint8_t IMU_WriteReg(uint8_t reg, uint8_t value)
 
 static uint8_t IMU_ReadBurst(uint8_t startReg, uint8_t *data, uint8_t len)
 {
-  uint8_t tmp_diag[128];
-  
   if ((data == NULL) || (len == 0U))
   {
     return 0U;
@@ -562,22 +525,14 @@ static uint8_t IMU_ReadBurst(uint8_t startReg, uint8_t *data, uint8_t len)
   HAL_GPIO_WritePin(IMU_CS_PORT, IMU_CS_PIN, GPIO_PIN_RESET);
   IMU_SpiDelay();  /* Ensure CS is settled before first transfer */
   
-  uint8_t addr_echo = IMU_SpiTransfer((uint8_t)(startReg | 0x80U));
+  (void)IMU_SpiTransfer((uint8_t)(startReg | 0x80U));
   IMU_SpiDelay();  /* Allow IMU to respond */
-  
-  int diag_len = snprintf((char*)tmp_diag, sizeof(tmp_diag), 
-                         "Addr=0x%02X Echo=0x%02X ", startReg, addr_echo);
 
   for (uint8_t i = 0U; i < len; i++)
   {
     data[i] = IMU_SpiTransfer(0x00U);
     IMU_SpiDelay();  /* Brief delay between bytes */
   }
-
-  diag_len += snprintf((char*)(tmp_diag + diag_len), sizeof(tmp_diag) - diag_len,
-                       "Data=%02X %02X %02X %02X %02X %02X\r\n",
-                       data[0], data[1], data[2], data[3], data[4], data[5]);
-  CDC_Transmit_FS(tmp_diag, diag_len);
 
   HAL_GPIO_WritePin(IMU_CS_PORT, IMU_CS_PIN, GPIO_PIN_SET);
   IMU_SpiDelay();  /* Ensure CS is settled before release */
@@ -701,16 +656,6 @@ static uint8_t IMU_ReadRaw(int16_t *gx, int16_t *gy, int16_t *gz)
   *gx = (int16_t)((((uint16_t)data[0]) << 8) | (uint16_t)data[1]);
   *gy = (int16_t)((((uint16_t)data[2]) << 8) | (uint16_t)data[3]);
   *gz = (int16_t)((((uint16_t)data[4]) << 8) | (uint16_t)data[5]);
-  
-  /* Debug: log raw bytes */
-  static uint32_t debug_count = 0;
-  if ((debug_count++ % 20) == 0) {
-    uint8_t tmp[128];
-    int len = snprintf((char*)tmp, sizeof(tmp), "GyroBytesRaw: %02X %02X %02X %02X %02X %02X\r\n",
-                      data[0], data[1], data[2], data[3], data[4], data[5]);
-    CDC_Transmit_FS(tmp, len);
-  }
-  
   return 1U;
 }
 
