@@ -18,14 +18,13 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#include "usb_device.h"
 #include "usbd_cdc_if.h"
 
 /* USER CODE END Includes */
@@ -57,12 +56,6 @@
 #define IMU_REG_GYRO_CONFIG0    0x4FU
 #define IMU_REG_ACCEL_CONFIG0   0x50U
 
-#define IMU_UART_INSTANCE       UART5
-#define IMU_UART_BAUDRATE       115200U
-#define IMU_UART_TX_PORT        GPIOB
-#define IMU_UART_TX_PIN         GPIO_PIN_13
-#define IMU_UART_TX_AF          GPIO_AF14_UART5
-
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -71,6 +64,10 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+
+UART_HandleTypeDef huart4;
+UART_HandleTypeDef huart5;
+UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
 
@@ -101,6 +98,13 @@ static float g_pitch_fused = 0.0f;
 static float g_yaw_fused = 0.0f;
 
 static uint8_t g_imu_spi_mode = 3U; /* 3=mode3, 0=mode0 */
+static uint8_t g_usb_ready = 0U;
+static uint32_t g_telemetry_sequence = 0U;
+
+#define TELEMETRY_PACKET_SOF1           0xA5U
+#define TELEMETRY_PACKET_SOF2           0x5AU
+#define TELEMETRY_PACKET_TYPE_TELEMETRY  0x01U
+#define TELEMETRY_PACKET_PAYLOAD_BYTES   28U
 
 /* USER CODE END PV */
 
@@ -108,8 +112,14 @@ static uint8_t g_imu_spi_mode = 3U; /* 3=mode3, 0=mode0 */
 void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_UART5_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_UART4_Init(void);
+/* USER CODE BEGIN PFP */
 static uint8_t MX_SPI4_Init(void);
-static void USB_WriteString(const char *text);
+static void Telemetry_SendPacket(int32_t pitch_cd, int32_t roll_cd, int32_t yaw_cd,
+                                 int16_t gx_raw, int16_t gy_raw, int16_t gz_raw,
+                                 int16_t ax_raw, int16_t ay_raw, int16_t az_raw);
 static uint8_t IMU_Probe(void);
 static uint8_t IMU_ReadWhoAmI(uint8_t reg, uint8_t *whoami);
 static uint8_t IMU_ReadReg(uint8_t reg, uint8_t *value);
@@ -122,14 +132,10 @@ static uint8_t IMU_SpiTransfer(uint8_t tx);
 static uint8_t IMU_SpiTransferMode0(uint8_t tx);
 static uint8_t IMU_SpiTransferMode3(uint8_t tx);
 static void IMU_SpiDelay(void);
-static void MX_UART4_Init(void);
-static void UART4_WriteString(const char *text);
-static void Debug_Attach_Window(void);
-static uint32_t Blink_Delay_Count(void);
 static void IMU_CalibrateGyro(void);
 static void IMU_CalibrateLevel(void);
 static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax, int16_t ay, int16_t az);
-/* USER CODE BEGIN PFP */
+static uint8_t IMU_TryBringup(void);
 
 /* USER CODE END PFP */
 
@@ -144,135 +150,108 @@ static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax
   */
 int main(void)
 {
-  /* MCU Configuration */
-  HAL_Init();
-  SystemClock_Config();
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MPU Configuration--------------------------------------------------------*/
   MPU_Config();
-  
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_UART5_Init();
+  MX_USART1_UART_Init();
   MX_USB_DEVICE_Init();
-  
-  /* Initialize SPI for IMU */
-  MX_SPI4_Init();
-  
-  /* Probe for IMU sensor */
-  g_imu_found = IMU_Probe();
-  
-  /* If IMU found, initialize and calibrate it */
-  if (g_imu_found)
-  {
-    IMU_Config();
-    HAL_Delay(100);  /* Wait for config to settle */
-    IMU_CalibrateGyro();  /* Calibrate gyro bias on level surface */
-    HAL_Delay(100);
-    IMU_CalibrateLevel();  /* Initialize pitch/roll from level position */
-    HAL_Delay(500);  /* Extra delay after calibration */
-  }
-  
-  uint32_t counter = 0;
-  uint8_t usb_buffer[128];
-  int16_t gyro_x, gyro_y, gyro_z;
-  int16_t accel_x, accel_y, accel_z;
-  
-  /* Integration variables for angle calculation */
-  float pitch_deg = 0.0f;
-  float roll_deg = 0.0f;
-  float yaw_deg = 0.0f;
-  uint32_t last_time_ms = 0;
-  
-  /* Wait for USB to enumerate */
+  MX_UART4_Init();
+  /* USER CODE BEGIN 2 */
+  uint32_t next_imu_probe_ms = 0U;
+
+  g_usb_ready = 1U;
+
+  (void)IMU_TryBringup();
+  next_imu_probe_ms = HAL_GetTick() + 500U;
+
   HAL_Delay(1000);
-  
-  /* Main loop */
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* LED toggle every 500ms (50 cycles @ 100Hz) */
-    static uint32_t led_counter = 0;
-    if (led_counter % 50 == 0) {
-      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_SET);
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+    int16_t gyro_x = 0;
+    int16_t gyro_y = 0;
+    int16_t gyro_z = 0;
+    int16_t accel_x = 0;
+    int16_t accel_y = 0;
+    int16_t accel_z = 0;
+    uint8_t sample_valid = 0U;
+
+    if ((g_imu_found == 0U) && (HAL_GetTick() >= next_imu_probe_ms))
+    {
+      (void)IMU_TryBringup();
+      next_imu_probe_ms = HAL_GetTick() + 500U;
     }
-    if (led_counter % 50 == 25) {
-      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_RESET);
-    }
-    led_counter++;
-    
-    /* Read IMU and stream data */
+
     if (g_imu_found)
     {
       uint8_t gyro_ok = IMU_ReadRaw(&gyro_x, &gyro_y, &gyro_z);
       uint8_t accel_ok = IMU_ReadAccel(&accel_x, &accel_y, &accel_z);
-      
+
       if (gyro_ok && accel_ok)
       {
-        /* Update fused Euler angles using complementary filter */
         IMU_UpdateEulerAngles(gyro_x, gyro_y, gyro_z, accel_x, accel_y, accel_z);
-        
-        /* Convert raw gyro to degrees/sec for display (apply bias correction) */
-        int16_t gx_corrected = gyro_x - (int16_t)g_gyro_bias_x;
-        int16_t gy_corrected = gyro_y - (int16_t)g_gyro_bias_y;
-        int16_t gz_corrected = gyro_z - (int16_t)g_gyro_bias_z;
-        
-        float gx_dps = (float)gx_corrected * 2000.0f / 32768.0f;
-        float gy_dps = (float)gy_corrected * 2000.0f / 32768.0f;
-        float gz_dps = (float)gz_corrected * 2000.0f / 32768.0f;
-        
-        /* Send fused P/R/Y and corrected gyro rates (convert to fixed point for display) */
-        int roll_i = (int)g_roll_fused;
-        int roll_f = (int)(fabsf(g_roll_fused - roll_i) * 10);
-        int pitch_i = (int)g_pitch_fused;
-        int pitch_f = (int)(fabsf(g_pitch_fused - pitch_i) * 10);
-        int yaw_i = (int)g_yaw_fused;
-        int yaw_f = (int)(fabsf(g_yaw_fused - yaw_i) * 10);
-        
-        int gx_i = (int)gx_dps;
-        int gx_f = (int)(fabsf(gx_dps - gx_i) * 10);
-        int gy_i = (int)gy_dps;
-        int gy_f = (int)(fabsf(gy_dps - gy_i) * 10);
-        int gz_i = (int)gz_dps;
-        int gz_f = (int)(fabsf(gz_dps - gz_i) * 10);
-        
-        /* Debug: show raw accel/gyro values */
-        uint8_t debug_buffer[128];
-        int debug_len = snprintf((char*)debug_buffer, sizeof(debug_buffer),
-                                "DEBUG| Ax:%6d Ay:%6d Az:%6d | Gx:%6d Gy:%6d Gz:%6d\r\n",
-                                accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z);
-        if (debug_len > 0) CDC_Transmit_FS(debug_buffer, debug_len);
-        HAL_Delay(10);  /* Small delay to ensure USB transmission */
-        
-        /* Format data first, then use backspaces to move cursor to start */
-        char data_str[100];
-        int data_len = snprintf(data_str, sizeof(data_str), 
-                               "[R:%+4d.%d P:%+4d.%d Y:%+4d.%d | Gx:%+4d.%d Gy:%+4d.%d Gz:%+4d.%d]",
-                               roll_i, roll_f, pitch_i, pitch_f, yaw_i, yaw_f,
-                               gx_i, gx_f, gy_i, gy_f, gz_i, gz_f);
-        
-        /* Build output with backspaces to move cursor back */
-        int len = 0;
-        uint8_t *ptr = usb_buffer;
-        
-        /* Fill first part with backspaces (or skip on first iteration) */
-        if (data_len > 0 && data_len < 100) {
-          for (int i = 0; i < data_len && len < (int)sizeof(usb_buffer) - 1; i++) {
-            ptr[len++] = '\b';  /* backspace character */
-          }
-          /* Copy data string */
-          for (int i = 0; i < data_len && len < (int)sizeof(usb_buffer) - 1; i++) {
-            ptr[len++] = data_str[i];
-          }
-        }
-        
-        if (len > 0) {
-          CDC_Transmit_FS(usb_buffer, (uint16_t)len);
-        }
+        sample_valid = 1U;
+
+        g_pitch_cd = (int32_t)lroundf(g_pitch_fused * 100.0f);
+        g_roll_cd = (int32_t)lroundf(g_roll_fused * 100.0f);
+        g_yaw_cd = (int32_t)lroundf(g_yaw_fused * 100.0f);
       }
     }
-    
-    /* Run loop at 100Hz (10ms period) */
+
+    if (sample_valid == 0U)
+    {
+      gyro_x = 0;
+      gyro_y = 0;
+      gyro_z = 0;
+      accel_x = 0;
+      accel_y = 0;
+      accel_z = 0;
+    }
+
+    Telemetry_SendPacket(g_pitch_cd,
+                         g_roll_cd,
+                         g_yaw_cd,
+                         gyro_x,
+                         gyro_y,
+                         gyro_z,
+                         accel_x,
+                         accel_y,
+                         accel_z);
+
     HAL_Delay(10);
   }
-  
-  return 0;
+  /* USER CODE END 3 */
 }
 
 /**
@@ -283,29 +262,35 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
 
-  /* Skip power config - already done in SystemInit() */
-  /* HAL_PWREx_ConfigSupply(PWR_LDO_SUPPLY); */
-  /* __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3); */
-  /* timeout loop for VOSRDY skipped */
+  /** Supply configuration update enable
+  */
+  HAL_PWREx_ConfigSupply(PWR_LDO_SUPPLY);
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+
+  while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_HSI48;
   RCC_OscInitStruct.HSIState = RCC_HSI_DIV1;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  
-  /* PLL setup for USB: HSI 64MHz -> PLL -> 48MHz USB (Q output), 120MHz system (P output) */
+  RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 8;    /* 64 MHz / 8 = 8 MHz reference */
-  RCC_OscInitStruct.PLL.PLLN = 60;   /* 8 MHz * 60 = 480 MHz VCO */
-  RCC_OscInitStruct.PLL.PLLP = 4;    /* 480 MHz / 4 = 120 MHz (system) */
-  RCC_OscInitStruct.PLL.PLLQ = 10;   /* 480 MHz / 10 = 48 MHz (USB) */
-  RCC_OscInitStruct.PLL.PLLR = 2;    /* 480 MHz / 2 = 240 MHz (unused) */
+  RCC_OscInitStruct.PLL.PLLM = 32;
+  RCC_OscInitStruct.PLL.PLLN = 129;
+  RCC_OscInitStruct.PLL.PLLP = 2;
+  RCC_OscInitStruct.PLL.PLLQ = 2;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_1;
+  RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
   RCC_OscInitStruct.PLL.PLLFRACN = 0;
-  
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -316,18 +301,169 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2
                               |RCC_CLOCKTYPE_D3PCLK1|RCC_CLOCKTYPE_D1PCLK1;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
   RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV2;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV2;
-  RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV2;
+  RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV1;
+  RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
   {
     Error_Handler();
   }
+
+  PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_USB;
+  PeriphClkInitStruct.UsbClockSelection = RCC_USBCLKSOURCE_HSI48;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief UART4 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_UART4_Init(void)
+{
+
+  /* USER CODE BEGIN UART4_Init 0 */
+
+  /* USER CODE END UART4_Init 0 */
+
+  /* USER CODE BEGIN UART4_Init 1 */
+
+  /* USER CODE END UART4_Init 1 */
+  huart4.Instance = UART4;
+  huart4.Init.BaudRate = 400000;
+  huart4.Init.WordLength = UART_WORDLENGTH_8B;
+  huart4.Init.StopBits = UART_STOPBITS_1;
+  huart4.Init.Parity = UART_PARITY_NONE;
+  huart4.Init.Mode = UART_MODE_TX_RX;
+  huart4.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart4.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart4.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart4.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart4.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart4, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart4, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN UART4_Init 2 */
+
+  /* USER CODE END UART4_Init 2 */
+
+}
+
+/**
+  * @brief UART5 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_UART5_Init(void)
+{
+
+  /* USER CODE BEGIN UART5_Init 0 */
+
+  /* USER CODE END UART5_Init 0 */
+
+  /* USER CODE BEGIN UART5_Init 1 */
+
+  /* USER CODE END UART5_Init 1 */
+  huart5.Instance = UART5;
+  huart5.Init.BaudRate = 115200;
+  huart5.Init.WordLength = UART_WORDLENGTH_8B;
+  huart5.Init.StopBits = UART_STOPBITS_1;
+  huart5.Init.Parity = UART_PARITY_NONE;
+  huart5.Init.Mode = UART_MODE_TX_RX;
+  huart5.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart5.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart5.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart5.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart5.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart5, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart5, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN UART5_Init 2 */
+
+  /* USER CODE END UART5_Init 2 */
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 420000;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart1.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart1, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart1, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
 }
 
 /**
@@ -343,31 +479,33 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOE_CLK_ENABLE();
 
-  /* PC2_C is behind an internal analog switch on H7 dual-pad pins. */
-  HAL_SYSCFG_AnalogSwitchConfig(SYSCFG_SWITCH_PC2, SYSCFG_SWITCH_PC2_CLOSE);
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_RESET);
 
-  /* Configure PC2 as push-pull output. */
+  /*Configure GPIO pin : PC2 */
   GPIO_InitStruct.Pin = GPIO_PIN_2;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_RESET);
+  /*AnalogSwitch Config */
+  HAL_SYSCFG_AnalogSwitchConfig(SYSCFG_SWITCH_PC2, SYSCFG_SWITCH_PC2_CLOSE);
 
-  /* IMU chip-select (SPI4) */
-  HAL_GPIO_WritePin(IMU_CS_PORT, IMU_CS_PIN, GPIO_PIN_SET);
-  GPIO_InitStruct.Pin = IMU_CS_PIN;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  HAL_GPIO_Init(IMU_CS_PORT, &GPIO_InitStruct);
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
 
-  /* IMU SPI bit-bang pins (SPI4 mapping on KAKUTEH7): PE2/PE5/PE6 */
-  GPIO_InitStruct.Pin = IMU_SCK_PIN | IMU_MOSI_PIN;
+  /* IMU bit-banged SPI pins: PE4=CS, PE2=SCK, PE6=MOSI, PE5=MISO */
+  HAL_GPIO_WritePin(GPIOE, IMU_CS_PIN, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOE, IMU_SCK_PIN, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOE, IMU_MOSI_PIN, GPIO_PIN_RESET);
+
+  GPIO_InitStruct.Pin = IMU_CS_PIN | IMU_SCK_PIN | IMU_MOSI_PIN;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
@@ -378,44 +516,140 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
-  HAL_GPIO_WritePin(IMU_SCK_PORT, IMU_SCK_PIN, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(IMU_MOSI_PORT, IMU_MOSI_PIN, GPIO_PIN_RESET);
-
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
 
 /**
-  * @brief Send string to USB CDC device (virtual COM port)
-  * @param text: null-terminated string to transmit
+  * @brief Send raw bytes to USB CDC device (virtual COM port)
+  * @param data: payload to transmit
+  * @param len: number of bytes to transmit
   * @retval None
   */
-static void USB_WriteString(const char *text)
+static void Serial_Write(const uint8_t *data, uint16_t len)
 {
-  if (text == NULL)
+  if ((data == NULL) || (len == 0U) || (g_usb_ready == 0U))
   {
     return;
   }
 
-  uint16_t len = 0;
-  while ((text[len] != '\0') && (len < 256U))
+  for (uint32_t retry = 0U; retry < 50U; retry++)
   {
-    len++;
+    if (CDC_Transmit_FS((uint8_t *)data, len) == USBD_OK)
+    {
+      return;
+    }
+
+    HAL_Delay(1);
+  }
+}
+
+static void Packet_PutU16LE(uint8_t *dst, uint16_t value)
+{
+  dst[0] = (uint8_t)(value & 0xFFU);
+  dst[1] = (uint8_t)((value >> 8) & 0xFFU);
+}
+
+static void Packet_PutU32LE(uint8_t *dst, uint32_t value)
+{
+  dst[0] = (uint8_t)(value & 0xFFU);
+  dst[1] = (uint8_t)((value >> 8) & 0xFFU);
+  dst[2] = (uint8_t)((value >> 16) & 0xFFU);
+  dst[3] = (uint8_t)((value >> 24) & 0xFFU);
+}
+
+static void Packet_PutS16LE(uint8_t *dst, int16_t value)
+{
+  Packet_PutU16LE(dst, (uint16_t)value);
+}
+
+static void Packet_PutS32LE(uint8_t *dst, int32_t value)
+{
+  Packet_PutU32LE(dst, (uint32_t)value);
+}
+
+static void Telemetry_SendPacket(int32_t pitch_cd, int32_t roll_cd, int32_t yaw_cd,
+                                 int16_t gx_raw, int16_t gy_raw, int16_t gz_raw,
+                                 int16_t ax_raw, int16_t ay_raw, int16_t az_raw)
+{
+  uint8_t frame[4U + TELEMETRY_PACKET_PAYLOAD_BYTES + 1U];
+  uint8_t checksum = 0U;
+  uint8_t payload_index = 0U;
+
+  frame[0] = TELEMETRY_PACKET_SOF1;
+  frame[1] = TELEMETRY_PACKET_SOF2;
+  frame[2] = TELEMETRY_PACKET_TYPE_TELEMETRY;
+  frame[3] = TELEMETRY_PACKET_PAYLOAD_BYTES;
+
+  Packet_PutU32LE(&frame[4U + payload_index], g_telemetry_sequence++);
+  payload_index = (uint8_t)(payload_index + 4U);
+
+  Packet_PutS32LE(&frame[4U + payload_index], pitch_cd);
+  payload_index = (uint8_t)(payload_index + 4U);
+  Packet_PutS32LE(&frame[4U + payload_index], roll_cd);
+  payload_index = (uint8_t)(payload_index + 4U);
+  Packet_PutS32LE(&frame[4U + payload_index], yaw_cd);
+  payload_index = (uint8_t)(payload_index + 4U);
+
+  Packet_PutS16LE(&frame[4U + payload_index], gx_raw);
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutS16LE(&frame[4U + payload_index], gy_raw);
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutS16LE(&frame[4U + payload_index], gz_raw);
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutS16LE(&frame[4U + payload_index], ax_raw);
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutS16LE(&frame[4U + payload_index], ay_raw);
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutS16LE(&frame[4U + payload_index], az_raw);
+
+  for (uint32_t i = 2U; i < (4U + TELEMETRY_PACKET_PAYLOAD_BYTES); i++)
+  {
+    checksum ^= frame[i];
   }
 
-  if (len > 0)
-  {
-    /* CDC_Transmit_FS((uint8_t *)text, len); */ /* Disabled: USB not yet initialized */
-  }
+  frame[4U + TELEMETRY_PACKET_PAYLOAD_BYTES] = checksum;
+
+  Serial_Write(frame, (uint16_t)sizeof(frame));
 }
 
 static uint8_t MX_SPI4_Init(void)
 {
   /* Bit-banged SPI uses GPIO only; pins are configured in MX_GPIO_Init. */
   g_imu_probe_error = 0U;
+  HAL_GPIO_WritePin(IMU_CS_PORT, IMU_CS_PIN, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(IMU_SCK_PORT, IMU_SCK_PIN, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(IMU_MOSI_PORT, IMU_MOSI_PIN, GPIO_PIN_RESET);
+
+  return 1U;
+}
+
+static uint8_t IMU_TryBringup(void)
+{
+  if (MX_SPI4_Init() == 0U)
+  {
+    g_imu_found = 0U;
+    return 0U;
+  }
+
+  g_imu_found = IMU_Probe();
+  if (g_imu_found == 0U)
+  {
+    return 0U;
+  }
+
+  if (IMU_Config() == 0U)
+  {
+    g_imu_found = 0U;
+    return 0U;
+  }
+
+  HAL_Delay(100);
+  IMU_CalibrateGyro();
+  HAL_Delay(100);
+  IMU_CalibrateLevel();
+  HAL_Delay(500);
 
   return 1U;
 }
@@ -459,12 +693,19 @@ static uint8_t IMU_ReadWhoAmI(uint8_t reg, uint8_t *whoami)
 static uint8_t IMU_Probe(void)
 {
   uint8_t whoami = 0U;
+  uint8_t whoami_verify = 0U;
 
   if (IMU_ReadWhoAmI(IMU_WHOAMI_REG_MPU, &whoami) != 0U)
   {
     if ((whoami == 0x68U) || (whoami == 0x70U) || (whoami == 0x71U) ||
         (whoami == 0x42U) || (whoami == 0x47U))
     {
+      if ((IMU_ReadReg(IMU_WHOAMI_REG_MPU, &whoami_verify) == 0U) || (whoami_verify != whoami))
+      {
+        g_imu_probe_error = 0xE304U; /* unstable WHO_AM_I */
+        return 0U;
+      }
+
       g_imu_bus_id = 4U; /* bus marker: SPI4 */
       g_imu_whoami = whoami;
       return 1U;
@@ -475,9 +716,8 @@ static uint8_t IMU_Probe(void)
   {
     if (whoami == 0x24U)
     {
-      g_imu_bus_id = 4U; /* bus marker: SPI4 */
-      g_imu_whoami = whoami;
-      return 1U;
+      g_imu_probe_error = 0xE320U; /* BMI270 detected: current config path supports ICM-class only */
+      return 0U;
     }
   }
 
@@ -604,10 +844,6 @@ static uint8_t IMU_Config(void)
  */
 static void IMU_CalibrateGyro(void)
 {
-  uint8_t usb_buffer[128];
-  int len = snprintf((char*)usb_buffer, sizeof(usb_buffer), "Calibrating gyro...\r\n");
-  CDC_Transmit_FS(usb_buffer, len);
-  
   int32_t sum_gx = 0, sum_gy = 0, sum_gz = 0;
   int16_t gx, gy, gz;
   
@@ -626,11 +862,6 @@ static void IMU_CalibrateGyro(void)
   g_gyro_bias_y = sum_gy / 100;
   g_gyro_bias_z = sum_gz / 100;
   g_gyro_calibrated = 1U;
-  
-  len = snprintf((char*)usb_buffer, sizeof(usb_buffer), 
-                "Gyro biases: %ld %ld %ld\r\n", 
-                g_gyro_bias_x, g_gyro_bias_y, g_gyro_bias_z);
-  CDC_Transmit_FS(usb_buffer, len);
 }
 
 /**
@@ -639,10 +870,6 @@ static void IMU_CalibrateGyro(void)
  */
 static void IMU_CalibrateLevel(void)
 {
-  uint8_t usb_buffer[128];
-  int len = snprintf((char*)usb_buffer, sizeof(usb_buffer), "Calibrating level...\r\n");
-  CDC_Transmit_FS(usb_buffer, len);
-  
   float sum_pitch = 0.0f, sum_roll = 0.0f;
   int16_t ax, ay, az;
   int num_samples = 100;
@@ -674,11 +901,6 @@ static void IMU_CalibrateLevel(void)
   /* If very close to zero (within ±2 degrees), snap to exact zero to eliminate noise */
   if (fabsf(g_pitch_fused) < 2.0f) g_pitch_fused = 0.0f;
   if (fabsf(g_roll_fused) < 2.0f) g_roll_fused = 0.0f;
-  
-  len = snprintf((char*)usb_buffer, sizeof(usb_buffer), 
-                "Level init: P:%.1f R:%.1f Y:%.1f\r\n", 
-                g_pitch_fused, g_roll_fused, g_yaw_fused);
-  CDC_Transmit_FS(usb_buffer, len);
 }
 
 /**
@@ -709,14 +931,6 @@ static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax
   float accel_roll = atan2f(ax_g, az_g) * 180.0f / 3.14159265f;
   
   /* DEBUG: Show what calibration thinks is level */
-  if (0) {  /* Set to 1 to enable debug */
-    uint8_t debug_buf[100];
-    int dlen = snprintf((char*)debug_buf, sizeof(debug_buf), 
-      "Raw: ax=%.2f ay=%.2f az=%.2f | CalcP=%.1f CalcR=%.1f\r\n",
-      ax_g, ay_g, az_g, accel_pitch, accel_roll);
-    if (dlen > 0) CDC_Transmit_FS(debug_buf, dlen);
-  }
-  
   /* Complementary filter at 100Hz (dt = 0.01s) */
   /* Use low alpha (~0.05) since we update at 100Hz, most trust goes to gyro integration */
   const float dt = 0.01f;
@@ -795,6 +1009,7 @@ static uint8_t IMU_SpiTransferMode3(uint8_t tx)
 
   for (uint32_t bit = 0U; bit < 8U; bit++)
   {
+    /* CPOL=1, CPHA=1: change on falling edge, sample on rising edge. */
     HAL_GPIO_WritePin(IMU_MOSI_PORT,
                       IMU_MOSI_PIN,
                       ((tx & 0x80U) != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
@@ -803,14 +1018,14 @@ static uint8_t IMU_SpiTransferMode3(uint8_t tx)
     HAL_GPIO_WritePin(IMU_SCK_PORT, IMU_SCK_PIN, GPIO_PIN_RESET);
     IMU_SpiDelay();
 
+    HAL_GPIO_WritePin(IMU_SCK_PORT, IMU_SCK_PIN, GPIO_PIN_SET);
+    IMU_SpiDelay();
+
     rx <<= 1;
     if (HAL_GPIO_ReadPin(IMU_MISO_PORT, IMU_MISO_PIN) == GPIO_PIN_SET)
     {
       rx |= 1U;
     }
-
-    HAL_GPIO_WritePin(IMU_SCK_PORT, IMU_SCK_PIN, GPIO_PIN_SET);
-    IMU_SpiDelay();
   }
 
   return rx;
@@ -825,77 +1040,11 @@ static void IMU_SpiDelay(void)
   }
 }
 
-static void MX_UART4_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  uint32_t pclk1Hz;
-
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-  __HAL_RCC_UART5_CLK_ENABLE();
-
-  GPIO_InitStruct.Pin = IMU_UART_TX_PIN;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  GPIO_InitStruct.Alternate = IMU_UART_TX_AF;
-  HAL_GPIO_Init(IMU_UART_TX_PORT, &GPIO_InitStruct);
-
-  IMU_UART_INSTANCE->CR1 = 0U;
-  IMU_UART_INSTANCE->CR2 = 0U;
-  IMU_UART_INSTANCE->CR3 = 0U;
-
-  pclk1Hz = HAL_RCC_GetPCLK2Freq();  /* UART5 is on APB2 */
-  IMU_UART_INSTANCE->BRR = (pclk1Hz + (IMU_UART_BAUDRATE / 2U)) / IMU_UART_BAUDRATE;
-  IMU_UART_INSTANCE->CR1 = USART_CR1_TE;
-  IMU_UART_INSTANCE->CR1 |= USART_CR1_UE;
-}
-
-static void UART4_WriteString(const char *text)
-{
-  if (text == NULL)
-  {
-    return;
-  }
-
-  while (*text != '\0')
-  {
-    while ((IMU_UART_INSTANCE->ISR & USART_ISR_TXE_TXFNF) == 0U)
-    {
-    }
-
-    IMU_UART_INSTANCE->TDR = (uint8_t)(*text);
-    text++;
-  }
-}
-
-static void Debug_Attach_Window(void)
-{
-  /* Give the probe several seconds and exit early once debugger is attached. */
-  for (volatile uint32_t i = 0; i < 120000000UL; i++)
-  {
-    if ((CoreDebug->DHCSR & CoreDebug_DHCSR_C_DEBUGEN_Msk) != 0U)
-    {
-      break;
-    }
-    __NOP();
-  }
-}
-
-static uint32_t Blink_Delay_Count(void)
-{
-  if ((CoreDebug->DHCSR & CoreDebug_DHCSR_C_DEBUGEN_Msk) != 0U)
-  {
-    return 16000000UL;
-  }
-
-  return 8000000UL;
-}
-
 /* USER CODE END 4 */
 
  /* MPU Configuration */
 
-__attribute__((unused)) static void MPU_Config(void)
+void MPU_Config(void)
 {
   MPU_Region_InitTypeDef MPU_InitStruct = {0};
 
@@ -904,7 +1053,6 @@ __attribute__((unused)) static void MPU_Config(void)
 
   /** Initializes and configures the Region and the memory to be protected
   */
-  MPU_InitStruct.Enable = MPU_REGION_ENABLE;
   MPU_InitStruct.Number = MPU_REGION_NUMBER0;
   MPU_InitStruct.BaseAddress = 0x0;
   MPU_InitStruct.Size = MPU_REGION_SIZE_4GB;
