@@ -55,6 +55,27 @@
 #define IMU_REG_PWR_MGMT0       0x4EU
 #define IMU_REG_GYRO_CONFIG0    0x4FU
 #define IMU_REG_ACCEL_CONFIG0   0x50U
+#define IMU_ACCEL_LSB_PER_G     2048.0f
+#define IMU_GYRO_DPS_PER_LSB    (2000.0f / 32768.0f)
+
+#define IMU_ALIGN_CW0           0U
+#define IMU_ALIGN_CW90          1U
+#define IMU_ALIGN_CW180         2U
+#define IMU_ALIGN_CW270         3U
+/* Board-to-sensor alignment mapping (matches verified physical orientation). */
+#define IMU_SENSOR_ALIGNMENT     IMU_ALIGN_CW270
+
+#define CRSF_FRAME_TYPE_RC_CHANNELS     0x16U
+#define CRSF_SYNC_BYTE                  0xC8U
+#define CRSF_ADDRESS_BROADCAST          0x00U
+#define CRSF_ADDRESS_RADIO_TX           0xEAU
+#define CRSF_ADDRESS_CRSF_RX            0xECU
+#define CRSF_ADDRESS_CRSF_TX            0xEEU
+#define CRSF_MAX_FRAME_BYTES            64U
+#define CRSF_RC_CHANNEL_COUNT           16U
+#define CRSF_RC_PAYLOAD_BYTES           22U
+#define CRSF_FRAME_GAP_RESET_MS         3U
+#define CRSF_RX_FIFO_SIZE               256U
 
 /* USER CODE END PD */
 
@@ -96,15 +117,52 @@ static uint8_t g_gyro_calibrated = 0U;
 static float g_roll_fused = 0.0f;
 static float g_pitch_fused = 0.0f;
 static float g_yaw_fused = 0.0f;
+static float g_q0 = 1.0f;
+static float g_q1 = 0.0f;
+static float g_q2 = 0.0f;
+static float g_q3 = 0.0f;
 
 static uint8_t g_imu_spi_mode = 3U; /* 3=mode3, 0=mode0 */
 static uint8_t g_usb_ready = 0U;
 static uint32_t g_telemetry_sequence = 0U;
 
+static volatile uint16_t g_rc_channels_raw[CRSF_RC_CHANNEL_COUNT] = {0U};
+static volatile uint16_t g_rc_channels_us[CRSF_RC_CHANNEL_COUNT] = {
+  1500U, 1500U, 1000U, 1500U,
+  1500U, 1500U, 1500U, 1500U,
+  1500U, 1500U, 1500U, 1500U,
+  1500U, 1500U, 1500U, 1500U
+};
+static volatile uint32_t g_rc_frame_count = 0U;
+static volatile uint32_t g_rc_last_frame_ms = 0U;
+static volatile uint8_t g_rc_link_ok = 0U;
+
+static uint8_t g_crsf_frame[CRSF_MAX_FRAME_BYTES] = {0U};
+static uint8_t g_crsf_frame_index = 0U;
+static uint8_t g_crsf_frame_target = 0U;
+static volatile uint8_t g_crsf_rx_fifo[CRSF_RX_FIFO_SIZE] = {0U};
+static volatile uint8_t g_crsf_rx_gap_fifo[CRSF_RX_FIFO_SIZE] = {0U};
+static volatile uint16_t g_crsf_rx_head = 0U;
+static volatile uint16_t g_crsf_rx_tail = 0U;
+
+static void RC_SetFailsafeNeutral(void)
+{
+  g_rc_channels_us[0] = 1500U;
+  g_rc_channels_us[1] = 1500U;
+  g_rc_channels_us[2] = 1000U;
+  g_rc_channels_us[3] = 1500U;
+  for (uint8_t ch = 4U; ch < CRSF_RC_CHANNEL_COUNT; ch++)
+  {
+    g_rc_channels_us[ch] = 1500U;
+  }
+}
+static uint8_t g_uart4_rx_byte = 0U;
+static volatile uint32_t g_crsf_last_isr_byte_ms = 0U;
+
 #define TELEMETRY_PACKET_SOF1           0xA5U
 #define TELEMETRY_PACKET_SOF2           0x5AU
 #define TELEMETRY_PACKET_TYPE_TELEMETRY  0x01U
-#define TELEMETRY_PACKET_PAYLOAD_BYTES   28U
+#define TELEMETRY_PACKET_PAYLOAD_BYTES   65U
 
 /* USER CODE END PV */
 
@@ -136,11 +194,72 @@ static void IMU_CalibrateGyro(void);
 static void IMU_CalibrateLevel(void);
 static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax, int16_t ay, int16_t az);
 static uint8_t IMU_TryBringup(void);
+static void CRSF_ProcessUart(void);
+static void CRSF_HandleFrame(const uint8_t *frame, uint8_t frame_len);
+static uint8_t CRSF_CalcCrc(const uint8_t *data, uint8_t len);
+static void CRSF_DecodeChannels(const uint8_t *payload);
+static uint16_t CRSF_ChannelRawToUs(uint16_t raw);
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart);
+static void IMU_ApplyAlignment(float x, float y, float z, float *xo, float *yo, float *zo);
+static void IMU_SetQuaternionFromEuler(float roll_deg, float pitch_deg, float yaw_deg);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+static void IMU_ApplyAlignment(float x, float y, float z, float *xo, float *yo, float *zo)
+{
+  if ((xo == NULL) || (yo == NULL) || (zo == NULL))
+  {
+    return;
+  }
+
+  switch (IMU_SENSOR_ALIGNMENT)
+  {
+    case IMU_ALIGN_CW90:
+      *xo = y;
+      *yo = -x;
+      *zo = z;
+      break;
+    case IMU_ALIGN_CW180:
+      *xo = -x;
+      *yo = -y;
+      *zo = z;
+      break;
+    case IMU_ALIGN_CW270:
+      *xo = -y;
+      *yo = x;
+      *zo = z;
+      break;
+    case IMU_ALIGN_CW0:
+    default:
+      *xo = x;
+      *yo = y;
+      *zo = z;
+      break;
+  }
+}
+
+static void IMU_SetQuaternionFromEuler(float roll_deg, float pitch_deg, float yaw_deg)
+{
+  const float roll = roll_deg * 3.14159265f / 180.0f;
+  const float pitch = pitch_deg * 3.14159265f / 180.0f;
+  const float yaw = yaw_deg * 3.14159265f / 180.0f;
+
+  const float cr = cosf(roll * 0.5f);
+  const float sr = sinf(roll * 0.5f);
+  const float cp = cosf(pitch * 0.5f);
+  const float sp = sinf(pitch * 0.5f);
+  const float cy = cosf(yaw * 0.5f);
+  const float sy = sinf(yaw * 0.5f);
+
+  g_q0 = cr * cp * cy + sr * sp * sy;
+  g_q1 = sr * cp * cy - cr * sp * sy;
+  g_q2 = cr * sp * cy + sr * cp * sy;
+  g_q3 = cr * cp * sy - sr * sp * cy;
+}
 
 /* USER CODE END 0 */
 
@@ -182,14 +301,21 @@ int main(void)
   MX_UART4_Init();
   /* USER CODE BEGIN 2 */
   uint32_t next_imu_probe_ms = 0U;
+  uint32_t now_ms = 0U;
+  uint32_t next_telemetry_ms = 0U;
 
   g_usb_ready = 1U;
 
   (void)IMU_TryBringup();
   next_imu_probe_ms = HAL_GetTick() + 500U;
+  next_telemetry_ms = HAL_GetTick();
+
+  if (HAL_UART_Receive_IT(&huart4, &g_uart4_rx_byte, 1U) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
   HAL_Delay(1000);
-
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -206,6 +332,18 @@ int main(void)
     int16_t accel_y = 0;
     int16_t accel_z = 0;
     uint8_t sample_valid = 0U;
+
+    CRSF_ProcessUart();
+    now_ms = HAL_GetTick();
+    if ((g_rc_last_frame_ms != 0U) && ((now_ms - g_rc_last_frame_ms) <= 100U))
+    {
+      g_rc_link_ok = 1U;
+    }
+    else
+    {
+      g_rc_link_ok = 0U;
+      RC_SetFailsafeNeutral();
+    }
 
     if ((g_imu_found == 0U) && (HAL_GetTick() >= next_imu_probe_ms))
     {
@@ -239,19 +377,226 @@ int main(void)
       accel_z = 0;
     }
 
-    Telemetry_SendPacket(g_pitch_cd,
-                         g_roll_cd,
-                         g_yaw_cd,
-                         gyro_x,
-                         gyro_y,
-                         gyro_z,
-                         accel_x,
-                         accel_y,
-                         accel_z);
-
-    HAL_Delay(10);
+    now_ms = HAL_GetTick();
+    if ((int32_t)(now_ms - next_telemetry_ms) >= 0)
+    {
+      Telemetry_SendPacket(g_pitch_cd,
+                           g_roll_cd,
+                           g_yaw_cd,
+                           gyro_x,
+                           gyro_y,
+                           gyro_z,
+                           accel_x,
+                           accel_y,
+                           accel_z);
+      next_telemetry_ms = now_ms + 10U;
+    }
   }
   /* USER CODE END 3 */
+}
+
+static void CRSF_ProcessUart(void)
+{
+  uint8_t byte = 0U;
+  uint8_t had_gap = 0U;
+
+  while (g_crsf_rx_tail != g_crsf_rx_head)
+  {
+    byte = g_crsf_rx_fifo[g_crsf_rx_tail];
+    had_gap = g_crsf_rx_gap_fifo[g_crsf_rx_tail];
+    g_crsf_rx_tail = (uint16_t)((g_crsf_rx_tail + 1U) & (CRSF_RX_FIFO_SIZE - 1U));
+
+    if ((had_gap != 0U) && (g_crsf_frame_index != 0U))
+    {
+      g_crsf_frame_index = 0U;
+      g_crsf_frame_target = 0U;
+    }
+
+    if (g_crsf_frame_index == 0U)
+    {
+      if ((byte != CRSF_SYNC_BYTE)
+          && (byte != CRSF_ADDRESS_BROADCAST)
+          && (byte != CRSF_ADDRESS_RADIO_TX)
+          && (byte != CRSF_ADDRESS_CRSF_RX)
+          && (byte != CRSF_ADDRESS_CRSF_TX))
+      {
+        continue;
+      }
+
+      g_crsf_frame[0] = byte;
+      g_crsf_frame_index = 1U;
+      g_crsf_frame_target = 0U;
+      continue;
+    }
+
+    if (g_crsf_frame_index == 1U)
+    {
+      /* Length counts TYPE + PAYLOAD + CRC bytes. */
+      if ((byte < 2U) || ((uint16_t)byte + 2U > CRSF_MAX_FRAME_BYTES))
+      {
+        g_crsf_frame_index = 0U;
+        g_crsf_frame_target = 0U;
+        continue;
+      }
+
+      g_crsf_frame[1] = byte;
+      g_crsf_frame_target = (uint8_t)(byte + 2U);
+      g_crsf_frame_index = 2U;
+      continue;
+    }
+
+    g_crsf_frame[g_crsf_frame_index++] = byte;
+
+    if ((g_crsf_frame_target != 0U) && (g_crsf_frame_index >= g_crsf_frame_target))
+    {
+      CRSF_HandleFrame(g_crsf_frame, g_crsf_frame_target);
+      g_crsf_frame_index = 0U;
+      g_crsf_frame_target = 0U;
+    }
+  }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == UART4)
+  {
+    uint32_t now_ms = HAL_GetTick();
+    uint8_t had_gap = 0U;
+    if ((g_crsf_last_isr_byte_ms != 0U) && ((now_ms - g_crsf_last_isr_byte_ms) > CRSF_FRAME_GAP_RESET_MS))
+    {
+      had_gap = 1U;
+    }
+    g_crsf_last_isr_byte_ms = now_ms;
+
+    uint16_t next_head = (uint16_t)((g_crsf_rx_head + 1U) & (CRSF_RX_FIFO_SIZE - 1U));
+    if (next_head != g_crsf_rx_tail)
+    {
+      g_crsf_rx_fifo[g_crsf_rx_head] = g_uart4_rx_byte;
+      g_crsf_rx_gap_fifo[g_crsf_rx_head] = had_gap;
+      g_crsf_rx_head = next_head;
+    }
+
+    (void)HAL_UART_Receive_IT(&huart4, &g_uart4_rx_byte, 1U);
+  }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == UART4)
+  {
+    (void)HAL_UART_AbortReceive(huart);
+    (void)HAL_UART_Receive_IT(&huart4, &g_uart4_rx_byte, 1U);
+  }
+}
+
+static void CRSF_HandleFrame(const uint8_t *frame, uint8_t frame_len)
+{
+  uint8_t length = 0U;
+  uint8_t payload_len = 0U;
+  uint8_t type = 0U;
+  uint8_t crc_rx = 0U;
+  uint8_t crc_calc = 0U;
+
+  if ((frame == NULL) || (frame_len < 4U))
+  {
+    return;
+  }
+
+  length = frame[1];
+  if ((uint8_t)(length + 2U) != frame_len)
+  {
+    return;
+  }
+
+  type = frame[2];
+  payload_len = (uint8_t)(length - 2U);
+
+  crc_rx = frame[frame_len - 1U];
+  crc_calc = CRSF_CalcCrc(&frame[2], (uint8_t)(length - 1U));
+
+  if (crc_calc != crc_rx)
+  {
+    return;
+  }
+
+  if ((type == CRSF_FRAME_TYPE_RC_CHANNELS) && (payload_len == CRSF_RC_PAYLOAD_BYTES))
+  {
+    CRSF_DecodeChannels(&frame[3]);
+    g_rc_frame_count++;
+    g_rc_last_frame_ms = HAL_GetTick();
+  }
+}
+
+static uint8_t CRSF_CalcCrc(const uint8_t *data, uint8_t len)
+{
+  uint8_t crc = 0U;
+
+  if (data == NULL)
+  {
+    return 0U;
+  }
+
+  for (uint8_t i = 0U; i < len; i++)
+  {
+    crc ^= data[i];
+    for (uint8_t bit = 0U; bit < 8U; bit++)
+    {
+      if ((crc & 0x80U) != 0U)
+      {
+        crc = (uint8_t)((crc << 1U) ^ 0xD5U);
+      }
+      else
+      {
+        crc <<= 1U;
+      }
+    }
+  }
+
+  return crc;
+}
+
+static void CRSF_DecodeChannels(const uint8_t *payload)
+{
+  uint32_t bits = 0U;
+  uint16_t raw = 0U;
+  uint8_t byte_index = 0U;
+  uint8_t shift = 0U;
+
+  if (payload == NULL)
+  {
+    return;
+  }
+
+  for (uint8_t ch = 0U; ch < CRSF_RC_CHANNEL_COUNT; ch++)
+  {
+    bits = (uint32_t)ch * 11U;
+    byte_index = (uint8_t)(bits / 8U);
+    shift = (uint8_t)(bits % 8U);
+
+    raw = (uint16_t)(((uint32_t)payload[byte_index]
+           | ((uint32_t)payload[byte_index + 1U] << 8U)
+           | ((uint32_t)payload[byte_index + 2U] << 16U)) >> shift) & 0x07FFU;
+
+    g_rc_channels_raw[ch] = raw;
+    g_rc_channels_us[ch] = CRSF_ChannelRawToUs(raw);
+  }
+}
+
+static uint16_t CRSF_ChannelRawToUs(uint16_t raw)
+{
+  int32_t clamped = raw;
+
+  if (clamped < 172)
+  {
+    clamped = 172;
+  }
+  if (clamped > 1811)
+  {
+    clamped = 1811;
+  }
+
+  /* CRSF nominal mapping: 172..1811 -> 988..2012 us */
+  return (uint16_t)(988 + ((clamped - 172) * 1024) / 1639);
 }
 
 /**
@@ -338,7 +683,7 @@ static void MX_UART4_Init(void)
 
   /* USER CODE END UART4_Init 1 */
   huart4.Instance = UART4;
-  huart4.Init.BaudRate = 400000;
+  huart4.Init.BaudRate = 420000;
   huart4.Init.WordLength = UART_WORDLENGTH_8B;
   huart4.Init.StopBits = UART_STOPBITS_1;
   huart4.Init.Parity = UART_PARITY_NONE;
@@ -603,6 +948,27 @@ static void Telemetry_SendPacket(int32_t pitch_cd, int32_t roll_cd, int32_t yaw_
   Packet_PutS16LE(&frame[4U + payload_index], ay_raw);
   payload_index = (uint8_t)(payload_index + 2U);
   Packet_PutS16LE(&frame[4U + payload_index], az_raw);
+  payload_index = (uint8_t)(payload_index + 2U);
+
+  frame[4U + payload_index] = g_rc_link_ok;
+  payload_index = (uint8_t)(payload_index + 1U);
+
+  Packet_PutU32LE(&frame[4U + payload_index], g_rc_frame_count);
+  payload_index = (uint8_t)(payload_index + 4U);
+
+  Packet_PutU16LE(&frame[4U + payload_index], g_rc_channels_us[0]);
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutU16LE(&frame[4U + payload_index], g_rc_channels_us[1]);
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutU16LE(&frame[4U + payload_index], g_rc_channels_us[2]);
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutU16LE(&frame[4U + payload_index], g_rc_channels_us[3]);
+  payload_index = (uint8_t)(payload_index + 2U);
+  for (uint8_t ch = 4U; ch < CRSF_RC_CHANNEL_COUNT; ch++)
+  {
+    Packet_PutU16LE(&frame[4U + payload_index], g_rc_channels_us[ch]);
+    payload_index = (uint8_t)(payload_index + 2U);
+  }
 
   for (uint32_t i = 2U; i < (4U + TELEMETRY_PACKET_PAYLOAD_BYTES); i++)
   {
@@ -879,13 +1245,18 @@ static void IMU_CalibrateLevel(void)
     if (IMU_ReadAccel(&ax, &ay, &az))
     {
       /* Convert accel to g units (±16g range) */
-      float ax_g = (float)ax / 2048.0f;
-      float ay_g = (float)ay / 2048.0f;
-      float az_g = (float)az / 2048.0f;
+      float ax_g = (float)ax / IMU_ACCEL_LSB_PER_G;
+      float ay_g = (float)ay / IMU_ACCEL_LSB_PER_G;
+      float az_g = (float)az / IMU_ACCEL_LSB_PER_G;
+      float ax_aligned = 0.0f;
+      float ay_aligned = 0.0f;
+      float az_aligned = 0.0f;
+
+      IMU_ApplyAlignment(ax_g, ay_g, az_g, &ax_aligned, &ay_aligned, &az_aligned);
       
-      /* Calculate accel angles - use same formulas as main filter */
-      float accel_pitch = atan2f(-ay_g, az_g) * 180.0f / 3.14159265f;
-      float accel_roll = atan2f(ax_g, az_g) * 180.0f / 3.14159265f;
+      /* Tilt-stable accel angles: minimizes roll/pitch cross-coupling near ±90 deg pitch. */
+      float accel_pitch = atan2f(-ax_aligned, sqrtf((ay_aligned * ay_aligned) + (az_aligned * az_aligned))) * 180.0f / 3.14159265f;
+      float accel_roll = atan2f(ay_aligned, az_aligned) * 180.0f / 3.14159265f;
       
       sum_pitch += accel_pitch;
       sum_roll += accel_roll;
@@ -901,6 +1272,8 @@ static void IMU_CalibrateLevel(void)
   /* If very close to zero (within ±2 degrees), snap to exact zero to eliminate noise */
   if (fabsf(g_pitch_fused) < 2.0f) g_pitch_fused = 0.0f;
   if (fabsf(g_roll_fused) < 2.0f) g_roll_fused = 0.0f;
+
+  IMU_SetQuaternionFromEuler(g_roll_fused, g_pitch_fused, g_yaw_fused);
 }
 
 /**
@@ -909,49 +1282,144 @@ static void IMU_CalibrateLevel(void)
  */
 static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax, int16_t ay, int16_t az)
 {
+  static uint32_t s_last_update_ms = 0U;
+  static float s_err_int_x = 0.0f;
+  static float s_err_int_y = 0.0f;
+  uint32_t now_ms = HAL_GetTick();
+  float dt = 0.01f;
+
+  if (s_last_update_ms != 0U)
+  {
+    uint32_t delta_ms = now_ms - s_last_update_ms;
+    if (delta_ms == 0U)
+    {
+      dt = 0.001f;
+    }
+    else
+    {
+      dt = (float)delta_ms * 0.001f;
+      if (dt < 0.001f)
+      {
+        dt = 0.001f;
+      }
+      else if (dt > 0.05f)
+      {
+        dt = 0.05f;
+      }
+    }
+  }
+  s_last_update_ms = now_ms;
+
   /* Apply gyro bias correction */
   int16_t gx_corrected = gx - (int16_t)g_gyro_bias_x;
   int16_t gy_corrected = gy - (int16_t)g_gyro_bias_y;
   int16_t gz_corrected = gz - (int16_t)g_gyro_bias_z;
   
   /* Convert gyro to degrees/sec (2000 dps range) */
-  float gx_dps = (float)gx_corrected * 2000.0f / 32768.0f;
-  float gy_dps = (float)gy_corrected * 2000.0f / 32768.0f;
-  float gz_dps = (float)gz_corrected * 2000.0f / 32768.0f;
+  float gx_dps = (float)gx_corrected * IMU_GYRO_DPS_PER_LSB;
+  float gy_dps = (float)gy_corrected * IMU_GYRO_DPS_PER_LSB;
+  float gz_dps = (float)gz_corrected * IMU_GYRO_DPS_PER_LSB;
+  float gx_aligned = 0.0f;
+  float gy_aligned = 0.0f;
+  float gz_aligned = 0.0f;
+
+  IMU_ApplyAlignment(gx_dps, gy_dps, gz_dps, &gx_aligned, &gy_aligned, &gz_aligned);
+
+  /* Body rates in rad/s (p,q,r). */
+  float p = gx_aligned * 3.14159265f / 180.0f;
+  float q = gy_aligned * 3.14159265f / 180.0f;
+  float r = gz_aligned * 3.14159265f / 180.0f;
   
   /* Convert accel to g units (±16g range) */
-  float ax_g = (float)ax / 2048.0f;
-  float ay_g = (float)ay / 2048.0f;
-  float az_g = (float)az / 2048.0f;
+  float ax_g = (float)ax / IMU_ACCEL_LSB_PER_G;
+  float ay_g = (float)ay / IMU_ACCEL_LSB_PER_G;
+  float az_g = (float)az / IMU_ACCEL_LSB_PER_G;
+  float ax_aligned = 0.0f;
+  float ay_aligned = 0.0f;
+  float az_aligned = 0.0f;
+
+  IMU_ApplyAlignment(ax_g, ay_g, az_g, &ax_aligned, &ay_aligned, &az_aligned);
   
-  /* Calculate accel-only pitch/roll using atan2 for full range (no saturation) */
-  /* Pitch = rotation around X axis */
-  float accel_pitch = atan2f(-ay_g, az_g) * 180.0f / 3.14159265f;
-  /* Roll = rotation around Y axis */
-  float accel_roll = atan2f(ax_g, az_g) * 180.0f / 3.14159265f;
-  
-  /* DEBUG: Show what calibration thinks is level */
-  /* Complementary filter at 100Hz (dt = 0.01s) */
-  /* Use low alpha (~0.05) since we update at 100Hz, most trust goes to gyro integration */
-  const float dt = 0.01f;
-  const float alpha = 0.05f;  /* 5% accel, 95% gyro (tuned for 100Hz) */
-  
-  /* Pitch integrates from gx (rotation about X axis) */
-  g_pitch_fused = (1.0f - alpha) * (g_pitch_fused + gx_dps * dt) + alpha * accel_pitch;
-  /* Roll integrates from gy (rotation about Y axis) */
-  g_roll_fused = (1.0f - alpha) * (g_roll_fused + gy_dps * dt) + alpha * accel_roll;
-  /* Yaw integrates from gz (rotation about Z axis) - no accel correction */
-  g_yaw_fused += gz_dps * dt;
+  /* Quaternion Mahony-style correction avoids Euler singularities near vertical pitch. */
+  const float kp = 2.2f;
+  const float ki = 0.08f;
+
+  const float acc_norm = sqrtf((ax_aligned * ax_aligned) + (ay_aligned * ay_aligned) + (az_aligned * az_aligned));
+  /* Use accel correction only when acceleration is near 1g to avoid dynamic-motion corruption. */
+  if ((acc_norm > 0.7f) && (acc_norm < 1.3f))
+  {
+    const float axn = ax_aligned / acc_norm;
+    const float ayn = ay_aligned / acc_norm;
+    const float azn = az_aligned / acc_norm;
+    float acc_trust = 1.0f - (fabsf(acc_norm - 1.0f) / 0.3f);
+    if (acc_trust < 0.0f)
+    {
+      acc_trust = 0.0f;
+    }
+    if (acc_trust > 1.0f)
+    {
+      acc_trust = 1.0f;
+    }
+
+    const float vx = 2.0f * (g_q1 * g_q3 - g_q0 * g_q2);
+    const float vy = 2.0f * (g_q0 * g_q1 + g_q2 * g_q3);
+    const float vz = g_q0 * g_q0 - g_q1 * g_q1 - g_q2 * g_q2 + g_q3 * g_q3;
+
+    const float ex = (ayn * vz - azn * vy);
+    const float ey = (azn * vx - axn * vz);
+    s_err_int_x += ex * dt;
+    s_err_int_y += ey * dt;
+
+    /* Bound integral term to prevent windup during aggressive maneuvers. */
+    if (s_err_int_x > 0.5f) s_err_int_x = 0.5f;
+    if (s_err_int_x < -0.5f) s_err_int_x = -0.5f;
+    if (s_err_int_y > 0.5f) s_err_int_y = 0.5f;
+    if (s_err_int_y < -0.5f) s_err_int_y = -0.5f;
+
+    p += (kp * acc_trust) * ex;
+    q += (kp * acc_trust) * ey;
+
+    p += (ki * acc_trust) * s_err_int_x;
+    q += (ki * acc_trust) * s_err_int_y;
+  }
+  else
+  {
+    /* Mild decay when accel is not trusted. */
+    s_err_int_x *= 0.995f;
+    s_err_int_y *= 0.995f;
+  }
+
+  const float qDot0 = 0.5f * (-g_q1 * p - g_q2 * q - g_q3 * r);
+  const float qDot1 = 0.5f * ( g_q0 * p + g_q2 * r - g_q3 * q);
+  const float qDot2 = 0.5f * ( g_q0 * q - g_q1 * r + g_q3 * p);
+  const float qDot3 = 0.5f * ( g_q0 * r + g_q1 * q - g_q2 * p);
+
+  g_q0 += qDot0 * dt;
+  g_q1 += qDot1 * dt;
+  g_q2 += qDot2 * dt;
+  g_q3 += qDot3 * dt;
+
+  const float qn = sqrtf(g_q0 * g_q0 + g_q1 * g_q1 + g_q2 * g_q2 + g_q3 * g_q3);
+  if (qn > 1e-6f)
+  {
+    g_q0 /= qn;
+    g_q1 /= qn;
+    g_q2 /= qn;
+    g_q3 /= qn;
+  }
+
+  const float sinp = 2.0f * (g_q0 * g_q2 - g_q3 * g_q1);
+  const float sinp_clamped = (sinp > 1.0f) ? 1.0f : ((sinp < -1.0f) ? -1.0f : sinp);
+
+  g_roll_fused = atan2f(2.0f * (g_q0 * g_q1 + g_q2 * g_q3), 1.0f - 2.0f * (g_q1 * g_q1 + g_q2 * g_q2)) * 180.0f / 3.14159265f;
+  g_pitch_fused = asinf(sinp_clamped) * 180.0f / 3.14159265f;
+  g_yaw_fused = atan2f(2.0f * (g_q0 * g_q3 + g_q1 * g_q2), 1.0f - 2.0f * (g_q2 * g_q2 + g_q3 * g_q3)) * 180.0f / 3.14159265f;
   
   /* Normalize pitch and roll to -180 to +180 range */
   while (g_pitch_fused > 180.0f) g_pitch_fused -= 360.0f;
   while (g_pitch_fused < -180.0f) g_pitch_fused += 360.0f;
   while (g_roll_fused > 180.0f) g_roll_fused -= 360.0f;
   while (g_roll_fused < -180.0f) g_roll_fused += 360.0f;
-  
-  /* Snap ±180° to 0° for pitch/roll (180° and 0° represent same orientation) */
-  if (fabsf(g_pitch_fused) > 175.0f) g_pitch_fused = 0.0f;
-  if (fabsf(g_roll_fused) > 175.0f) g_roll_fused = 0.0f;
   
   /* Wrap yaw to ±180 degrees */
   while (g_yaw_fused > 180.0f) g_yaw_fused -= 360.0f;
