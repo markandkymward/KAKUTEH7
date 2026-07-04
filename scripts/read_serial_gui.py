@@ -724,11 +724,11 @@ class TelemetryApp:
         q = self._fusion_ahrs.quaternion
         if hasattr(q, "to_euler"):
             euler = q.to_euler()
-            return float(euler[1]), float(-euler[0]), float(euler[2])
+            return float(-euler[1]), float(euler[0]), float(euler[2])
 
         if hasattr(imufusion, "quaternion_to_euler"):
             euler = imufusion.quaternion_to_euler(q)
-            return float(euler[1]), float(-euler[0]), float(euler[2])
+            return float(-euler[1]), float(euler[0]), float(euler[2])
 
         # Last-resort conversion from quaternion elements.
         qw = float(q.w)
@@ -738,7 +738,7 @@ class TelemetryApp:
         roll = math.degrees(math.atan2(qy * qz + qw * qx, qw * qw + qz * qz - 0.5))
         pitch = math.degrees(math.asin(max(-1.0, min(1.0, 2.0 * (qw * qy - qx * qz)))))
         yaw = math.degrees(math.atan2(qx * qy + qw * qz, qw * qw + qx * qx - 0.5))
-        return float(pitch), float(-roll), float(yaw)
+        return float(-pitch), float(roll), float(yaw)
 
     def _compute_fusion_quaternion(self, snapshot: TelemetryState):
         if (not self._fusion_ready) or (self._fusion_ahrs is None) or (self._fusion_bias is None) or (np is None):
@@ -776,11 +776,11 @@ class TelemetryApp:
     def _quaternion_to_euler_display(q) -> tuple[float, float, float]:
         if hasattr(q, "to_euler"):
             euler = q.to_euler()
-            return float(euler[1]), float(-euler[0]), float(euler[2])
+            return float(-euler[1]), float(euler[0]), float(euler[2])
 
         if hasattr(imufusion, "quaternion_to_euler"):
             euler = imufusion.quaternion_to_euler(q)
-            return float(euler[1]), float(-euler[0]), float(euler[2])
+            return float(-euler[1]), float(euler[0]), float(euler[2])
 
         qw = float(q.w)
         qx = float(q.x)
@@ -789,7 +789,7 @@ class TelemetryApp:
         roll = math.degrees(math.atan2(qy * qz + qw * qx, qw * qw + qz * qz - 0.5))
         pitch = math.degrees(math.asin(max(-1.0, min(1.0, 2.0 * (qw * qy - qx * qz)))))
         yaw = math.degrees(math.atan2(qx * qy + qw * qz, qw * qw + qx * qx - 0.5))
-        return float(pitch), float(-roll), float(yaw)
+        return float(-pitch), float(roll), float(yaw)
 
     def update(self) -> None:
         with self.lock:
@@ -841,13 +841,9 @@ class TelemetryApp:
         else:
             source_pitch, source_roll, source_yaw = snapshot.pitch_deg, snapshot.roll_deg, snapshot.yaw_deg
 
-        render_pitch, render_roll, render_yaw = self._select_continuous_euler(
-            source_pitch, source_roll, source_yaw
-        )
-
-        self._draw_attitude(render_pitch, render_roll, render_yaw)
+        self._draw_attitude(source_pitch, source_roll, source_yaw)
         self._draw_sticks(snapshot.channels)
-        self._draw_board_3d(render_pitch, render_roll, render_yaw, fusion_quaternion)
+        self._draw_board_3d(source_pitch, source_roll, source_yaw, fusion_quaternion)
         self._draw_channels(snapshot.channels)
 
         self.root.after(33, self.update)
