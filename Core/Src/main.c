@@ -103,9 +103,14 @@
 #define MOTOR_INIT_AT_BOOT              1U
 #define MOTOR_HW_OUTPUT_ENABLE          1U
 #define MOTOR_PROTOCOL_DSHOT300_TEST    0U
+#define MOTOR_DSHOT_BITRATE_HZ          300000U
 #define MOTOR_PWM_RATE_HZ               50U
 #define MOTOR_TIMER_TICK_HZ             1000000U
 #define MOTOR_SPIN_FLOOR_US             1070U
+#define MOTOR_DSHOT_MIN_ACTIVE_VALUE    300U
+#define MOTOR_DSHOT_BURST_FRAMES        4U
+#define MOTOR_DSHOT_ARM_PRIME_MS        400U
+#define MOTOR_DSHOT_ARM_PRIME_US        1250U
 /* Diagnostic: also drive legacy PA0-PA3 TIM2 outputs while using INAV S1-S4 map. */
 #define MOTOR_OUTPUT_DUAL_MAP_DIAG      0U
 
@@ -216,6 +221,8 @@ static uint8_t g_motor_dshot_ready = 0U;
 static uint32_t g_motor_dshot_bit_cycles = 0U;
 static uint32_t g_motor_dshot_t0h_cycles = 0U;
 static uint32_t g_motor_dshot_t1h_cycles = 0U;
+static uint32_t g_motor_dshot_arm_prime_until_ms = 0U;
+static uint8_t g_motor_was_armed = 0U;
 static uint16_t g_motor_cmd_us[MOTOR_COUNT] = {
   MOTOR_PWM_MIN_US,
   MOTOR_PWM_MIN_US,
@@ -348,6 +355,7 @@ static float MotorControl_ChannelToThrottle(uint16_t us)
 static uint16_t MotorDshot_UsToValue(uint16_t us)
 {
   uint16_t clamped_us = us;
+  uint16_t value = 0U;
 
   if (clamped_us <= MOTOR_PWM_MIN_US)
   {
@@ -359,7 +367,13 @@ static uint16_t MotorDshot_UsToValue(uint16_t us)
   }
 
   /* Map 1001..2000us to DShot throttle range 48..2047. */
-  return (uint16_t)(48U + (((uint32_t)(clamped_us - (MOTOR_PWM_MIN_US + 1U)) * 1999U) / 999U));
+  value = (uint16_t)(48U + (((uint32_t)(clamped_us - (MOTOR_PWM_MIN_US + 1U)) * 1999U) / 999U));
+  if (value < MOTOR_DSHOT_MIN_ACTIVE_VALUE)
+  {
+    value = MOTOR_DSHOT_MIN_ACTIVE_VALUE;
+  }
+
+  return value;
 }
 
 static uint16_t MotorDshot_EncodeThrottle(uint16_t throttle_value)
@@ -401,7 +415,7 @@ static uint8_t MotorDshot_Init(void)
   DWT->CYCCNT = 0U;
   DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
-  g_motor_dshot_bit_cycles = (hclk_hz + 150000U) / 300000U;
+  g_motor_dshot_bit_cycles = (hclk_hz + (MOTOR_DSHOT_BITRATE_HZ / 2U)) / MOTOR_DSHOT_BITRATE_HZ;
   if (g_motor_dshot_bit_cycles < 16U)
   {
     return 0U;
@@ -425,6 +439,9 @@ static void MotorDshot_SendFromUs(const uint16_t *motor_us)
 {
   uint16_t frame[MOTOR_COUNT] = {0U, 0U, 0U, 0U};
   const uint16_t pin_mask[MOTOR_COUNT] = {MOTOR1_GPIO_PIN, MOTOR2_GPIO_PIN, MOTOR3_GPIO_PIN, MOTOR4_GPIO_PIN};
+  uint16_t ones_mask_by_bit[16] = {0U};
+  uint16_t zero_mask_by_bit[16] = {0U};
+  uint32_t primask = 0U;
 
   if ((motor_us == NULL) || (g_motor_dshot_ready == 0U))
   {
@@ -439,42 +456,60 @@ static void MotorDshot_SendFromUs(const uint16_t *motor_us)
 
   for (uint8_t bit = 0U; bit < 16U; bit++)
   {
-    uint16_t ones_mask = 0U;
-    uint16_t zero_mask = 0U;
     const uint16_t bit_mask = (uint16_t)(1U << (15U - bit));
-    const uint32_t t_start = DWT->CYCCNT;
 
     for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
     {
       if ((frame[i] & bit_mask) != 0U)
       {
-        ones_mask |= pin_mask[i];
+        ones_mask_by_bit[bit] |= pin_mask[i];
       }
       else
       {
-        zero_mask |= pin_mask[i];
+        zero_mask_by_bit[bit] |= pin_mask[i];
       }
     }
-
-    GPIOB->BSRR = (uint32_t)MOTOR_DSHOT_GPIO_MASK;
-    while ((uint32_t)(DWT->CYCCNT - t_start) < g_motor_dshot_t0h_cycles) {}
-    GPIOB->BSRR = (uint32_t)zero_mask << 16U;
-    while ((uint32_t)(DWT->CYCCNT - t_start) < g_motor_dshot_t1h_cycles) {}
-    GPIOB->BSRR = (uint32_t)ones_mask << 16U;
-    while ((uint32_t)(DWT->CYCCNT - t_start) < g_motor_dshot_bit_cycles) {}
   }
 
-  GPIOB->BSRR = (uint32_t)MOTOR_DSHOT_GPIO_MASK << 16U;
+  primask = __get_PRIMASK();
+  __disable_irq();
+
+  for (uint8_t burst = 0U; burst < MOTOR_DSHOT_BURST_FRAMES; burst++)
   {
-    const uint32_t t_gap_start = DWT->CYCCNT;
-    const uint32_t gap_cycles = g_motor_dshot_bit_cycles * 2U;
-    while ((uint32_t)(DWT->CYCCNT - t_gap_start) < gap_cycles) {}
+    for (uint8_t bit = 0U; bit < 16U; bit++)
+    {
+      const uint16_t ones_mask = ones_mask_by_bit[bit];
+      const uint16_t zero_mask = zero_mask_by_bit[bit];
+      uint32_t t_start = 0U;
+
+      GPIOB->BSRR = (uint32_t)MOTOR_DSHOT_GPIO_MASK;
+      t_start = DWT->CYCCNT;
+      while ((uint32_t)(DWT->CYCCNT - t_start) < g_motor_dshot_t0h_cycles) {}
+      GPIOB->BSRR = (uint32_t)zero_mask << 16U;
+      while ((uint32_t)(DWT->CYCCNT - t_start) < g_motor_dshot_t1h_cycles) {}
+      GPIOB->BSRR = (uint32_t)ones_mask << 16U;
+      while ((uint32_t)(DWT->CYCCNT - t_start) < g_motor_dshot_bit_cycles) {}
+    }
+
+    GPIOB->BSRR = (uint32_t)MOTOR_DSHOT_GPIO_MASK << 16U;
+    {
+      const uint32_t t_gap_start = DWT->CYCCNT;
+      const uint32_t gap_cycles = g_motor_dshot_bit_cycles * 2U;
+      while ((uint32_t)(DWT->CYCCNT - t_gap_start) < gap_cycles) {}
+    }
+  }
+
+  if (primask == 0U)
+  {
+    __enable_irq();
   }
 }
 
 static void MotorControl_Disarm(void)
 {
   g_motors_armed = 0U;
+  g_motor_was_armed = 0U;
+  g_motor_dshot_arm_prime_until_ms = 0U;
   for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
   {
     g_motor_cmd_us[i] = MOTOR_PWM_MIN_US;
@@ -662,6 +697,7 @@ static void MotorControl_UpdateVirtual(void)
 {
   const uint8_t arm_switch_on = (g_rc_channels_us[4] >= MOTOR_ARM_SWITCH_US) ? 1U : 0U;
   const uint8_t fixed_test_on = (g_rc_channels_us[MOTOR_FIXED_TEST_ENABLE_CHANNEL] >= MOTOR_FIXED_TEST_ENABLE_US) ? 1U : 0U;
+  const uint32_t now_ms = HAL_GetTick();
   uint8_t real_mode_on = 0U;
   const float throttle = MotorControl_ChannelToThrottle(g_rc_channels_us[2]);
   const float roll = MotorControl_ChannelToBiPolar(g_rc_channels_us[0]);
@@ -715,6 +751,12 @@ static void MotorControl_UpdateVirtual(void)
   if (g_motors_armed == 0U)
   {
     g_motors_armed = 1U;
+  }
+
+  if ((g_motors_armed != 0U) && (g_motor_was_armed == 0U))
+  {
+    g_motor_was_armed = 1U;
+    g_motor_dshot_arm_prime_until_ms = now_ms + MOTOR_DSHOT_ARM_PRIME_MS;
   }
 
   if (g_motors_armed == 0U)
@@ -797,6 +839,15 @@ static void MotorControl_UpdateVirtual(void)
 #endif
 
     uint16_t throttle_us = (uint16_t)(MOTOR_PWM_MIN_US + (uint16_t)lroundf(throttle * 1000.0f));
+#if (MOTOR_PROTOCOL_DSHOT300_TEST != 0U)
+    if ((throttle_us > MOTOR_PWM_MIN_US) && (now_ms < g_motor_dshot_arm_prime_until_ms))
+    {
+      if (throttle_us < MOTOR_DSHOT_ARM_PRIME_US)
+      {
+        throttle_us = MOTOR_DSHOT_ARM_PRIME_US;
+      }
+    }
+#endif
     if (throttle_us > MOTOR_PWM_MIN_US)
     {
       if (throttle_us < MOTOR_SPIN_FLOOR_US)
