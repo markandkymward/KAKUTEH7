@@ -621,7 +621,7 @@ class TelemetryApp:
         def project(v: tuple[float, float, float]) -> tuple[float, float, float]:
             x, y, z = v
             # Display mapping so zero attitude appears flat and +X points into screen.
-            x_view = y
+            x_view = -y
             y_view = z
             z_view = -x
             dist = 420.0
