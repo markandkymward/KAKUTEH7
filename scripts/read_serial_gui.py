@@ -11,6 +11,8 @@ Requires:
 from __future__ import annotations
 
 import argparse
+import importlib
+import importlib.util
 import math
 import struct
 import threading
@@ -20,11 +22,27 @@ from dataclasses import dataclass, field
 from tkinter import ttk
 from typing import Iterable
 
+np = None
+try:
+    if importlib.util.find_spec("numpy") is not None:
+        np = importlib.import_module("numpy")
+except Exception:  # pragma: no cover
+    np = None
+
 try:
     import serial
     from serial.tools import list_ports
 except ImportError as exc:  # pragma: no cover
     raise SystemExit("pyserial is required. Install it with: pip install pyserial") from exc
+
+imufusion = None
+imufusion_error = ""
+try:
+    if importlib.util.find_spec("imufusion") is not None:
+        imufusion = importlib.import_module("imufusion")
+except Exception as exc:  # pragma: no cover
+    imufusion = None
+    imufusion_error = str(exc)
 
 
 SOF1 = 0xA5
@@ -32,6 +50,8 @@ SOF2 = 0x5A
 PACKET_TYPE_TELEMETRY = 0x01
 TELEMETRY_PAYLOAD_LEN = 65
 TELEMETRY_STRUCT = struct.Struct("<Iiii6hBI16H")
+IMU_ACCEL_LSB_PER_G = 2048.0
+IMU_GYRO_DPS_PER_LSB = 2000.0 / 32768.0
 
 
 def _checksum(packet_type: int, payload: bytes) -> int:
@@ -113,6 +133,9 @@ class TelemetryState:
     rc_frames: int = 0
     channels: list[int] = field(default_factory=lambda: [0] * 16)
     last_update_monotonic: float = 0.0
+    connected: bool = False
+    port_name: str = ""
+    status_text: str = "Sniffing serial ports..."
 
 
 class SerialReader(threading.Thread):
@@ -128,49 +151,105 @@ class SerialReader(threading.Thread):
     def stop(self) -> None:
         self.running = False
 
-    def run(self) -> None:
-        buffer = bytearray()
-        try:
-            with serial.Serial(self.port, self.baud, timeout=0.2) as ser:
-                while self.running:
-                    chunk = ser.read(ser.in_waiting or 1)
-                    if not chunk:
-                        continue
-                    buffer.extend(chunk)
-                    for values in _decode_frames(buffer):
-                        (
-                            sequence,
-                            pitch_cd,
-                            roll_cd,
-                            yaw_cd,
-                            gx,
-                            gy,
-                            gz,
-                            ax,
-                            ay,
-                            az,
-                            rc_link,
-                            rc_frames,
-                            *channels,
-                        ) = values
+    def _candidate_ports(self) -> list[str]:
+        if self.port.lower() != "auto":
+            return [self.port]
 
+        ports: list[str] = []
+        for p in list_ports.comports():
+            if "STLink" in p.description or "ST-LINK" in p.description:
+                continue
+            ports.append(p.device)
+        return ports
+
+    def run(self) -> None:
+        while self.running:
+            candidates = self._candidate_ports()
+            if not candidates:
+                with self.lock:
+                    self.state.connected = False
+                    self.state.status_text = "Sniffing: no candidate serial ports"
+                time.sleep(0.4)
+                continue
+
+            connected_once = False
+            for candidate in candidates:
+                if not self.running:
+                    break
+                try:
+                    with serial.Serial(candidate, self.baud, timeout=0.2) as ser:
+                        connected_once = True
                         with self.lock:
-                            self.state.sequence = int(sequence)
-                            self.state.pitch_deg = int(pitch_cd) / 100.0
-                            self.state.roll_deg = int(roll_cd) / 100.0
-                            self.state.yaw_deg = int(yaw_cd) / 100.0
-                            self.state.gx = int(gx)
-                            self.state.gy = int(gy)
-                            self.state.gz = int(gz)
-                            self.state.ax = int(ax)
-                            self.state.ay = int(ay)
-                            self.state.az = int(az)
-                            self.state.rc_link_ok = bool(rc_link)
-                            self.state.rc_frames = int(rc_frames)
-                            self.state.channels = [int(v) for v in channels]
-                            self.state.last_update_monotonic = time.monotonic()
-        except serial.SerialException as exc:
-            self.error_message = str(exc)
+                            self.state.connected = True
+                            self.state.port_name = candidate
+                            self.state.status_text = f"Connected: {candidate}"
+
+                        buffer = bytearray()
+                        last_packet_time = time.monotonic()
+                        while self.running:
+                            chunk = ser.read(ser.in_waiting or 1)
+                            if not chunk:
+                                # If stream goes idle for too long, force reopen so reconnect/sniff can recover.
+                                if (time.monotonic() - last_packet_time) > 2.0:
+                                    with self.lock:
+                                        self.state.connected = False
+                                        self.state.status_text = f"No data on {candidate}, reopening..."
+                                    break
+                                continue
+                            buffer.extend(chunk)
+                            for values in _decode_frames(buffer):
+                                (
+                                    sequence,
+                                    pitch_cd,
+                                    roll_cd,
+                                    yaw_cd,
+                                    gx,
+                                    gy,
+                                    gz,
+                                    ax,
+                                    ay,
+                                    az,
+                                    rc_link,
+                                    rc_frames,
+                                    *channels,
+                                ) = values
+
+                                with self.lock:
+                                    self.state.sequence = int(sequence)
+                                    self.state.pitch_deg = int(pitch_cd) / 100.0
+                                    self.state.roll_deg = int(roll_cd) / 100.0
+                                    self.state.yaw_deg = int(yaw_cd) / 100.0
+                                    self.state.gx = int(gx)
+                                    self.state.gy = int(gy)
+                                    self.state.gz = int(gz)
+                                    self.state.ax = int(ax)
+                                    self.state.ay = int(ay)
+                                    self.state.az = int(az)
+                                    self.state.rc_link_ok = bool(rc_link)
+                                    self.state.rc_frames = int(rc_frames)
+                                    self.state.channels = [int(v) for v in channels]
+                                    self.state.last_update_monotonic = time.monotonic()
+                                    self.state.connected = True
+                                    self.state.status_text = f"Connected: {candidate}"
+                                last_packet_time = time.monotonic()
+                except serial.SerialException as exc:
+                    self.error_message = str(exc)
+                    with self.lock:
+                        self.state.connected = False
+                        self.state.status_text = f"Port lost: {candidate} (sniffing...)"
+                    continue
+                except Exception as exc:  # pragma: no cover - defensive reconnect path
+                    self.error_message = str(exc)
+                    with self.lock:
+                        self.state.connected = False
+                        self.state.status_text = f"Reader error: {candidate} ({exc})"
+                    continue
+
+            if not connected_once:
+                with self.lock:
+                    self.state.connected = False
+                    self.state.status_text = "Sniffing serial ports..."
+                time.sleep(0.3)
 
 
 class TelemetryApp:
@@ -223,6 +302,90 @@ class TelemetryApp:
 
         self.footer_var = tk.StringVar(value="")
         ttk.Label(root, textvariable=self.footer_var, font=("Consolas", 10), padding=(10, 0, 10, 8)).pack(anchor=tk.W)
+        self._render_prev_valid = False
+        self._render_prev_pitch = 0.0
+        self._render_prev_roll = 0.0
+        self._render_prev_yaw = 0.0
+        self._fusion_ahrs = None
+        self._fusion_bias = None
+        self._fusion_last_monotonic = 0.0
+        self._fusion_ready = False
+        if imufusion is not None:
+            if hasattr(imufusion, "Bias") and hasattr(imufusion, "BiasSettings"):
+                self._fusion_bias = imufusion.Bias()
+                self._fusion_bias.settings = imufusion.BiasSettings(sample_rate=100)
+            elif hasattr(imufusion, "Offset"):
+                self._fusion_bias = imufusion.Offset(100)
+            self._fusion_ahrs = imufusion.Ahrs()
+            if hasattr(imufusion, "AhrsSettings"):
+                self._fusion_ahrs.settings = imufusion.AhrsSettings(
+                    convention=imufusion.CONVENTION_NWU,
+                    gain=0.45,
+                    gyroscope_range=2000,
+                    acceleration_rejection=90,
+                    magnetic_rejection=0,
+                    recovery_trigger_period=100,
+                )
+            elif hasattr(imufusion, "Settings"):
+                self._fusion_ahrs.settings = imufusion.Settings(
+                    imufusion.CONVENTION_NWU,
+                    0.45,
+                    2000,
+                    90,
+                    0,
+                    100,
+                )
+            self._fusion_ready = self._fusion_bias is not None
+
+    @staticmethod
+    def _wrap_deg(value: float) -> float:
+        while value > 180.0:
+            value -= 360.0
+        while value < -180.0:
+            value += 360.0
+        return value
+
+    @classmethod
+    def _angle_delta_deg(cls, to_value: float, from_value: float) -> float:
+        return cls._wrap_deg(to_value - from_value)
+
+    def _select_continuous_euler(self, pitch: float, roll: float, yaw: float) -> tuple[float, float, float]:
+        c1_pitch = self._wrap_deg(pitch)
+        c1_roll = self._wrap_deg(roll)
+        c1_yaw = self._wrap_deg(yaw)
+
+        # Equivalent ZYX Euler solution branch.
+        c2_pitch = self._wrap_deg(180.0 - pitch)
+        c2_roll = self._wrap_deg(roll + 180.0)
+        c2_yaw = self._wrap_deg(yaw + 180.0)
+
+        if not self._render_prev_valid:
+            self._render_prev_pitch = c1_pitch
+            self._render_prev_roll = c1_roll
+            self._render_prev_yaw = c1_yaw
+            self._render_prev_valid = True
+            return c1_pitch, c1_roll, c1_yaw
+
+        c1_cost = (
+            abs(self._angle_delta_deg(c1_pitch, self._render_prev_pitch))
+            + abs(self._angle_delta_deg(c1_roll, self._render_prev_roll))
+            + abs(self._angle_delta_deg(c1_yaw, self._render_prev_yaw))
+        )
+        c2_cost = (
+            abs(self._angle_delta_deg(c2_pitch, self._render_prev_pitch))
+            + abs(self._angle_delta_deg(c2_roll, self._render_prev_roll))
+            + abs(self._angle_delta_deg(c2_yaw, self._render_prev_yaw))
+        )
+
+        if c2_cost < c1_cost:
+            sel_pitch, sel_roll, sel_yaw = c2_pitch, c2_roll, c2_yaw
+        else:
+            sel_pitch, sel_roll, sel_yaw = c1_pitch, c1_roll, c1_yaw
+
+        self._render_prev_pitch = self._wrap_deg(self._render_prev_pitch + self._angle_delta_deg(sel_pitch, self._render_prev_pitch))
+        self._render_prev_roll = self._wrap_deg(self._render_prev_roll + self._angle_delta_deg(sel_roll, self._render_prev_roll))
+        self._render_prev_yaw = self._wrap_deg(self._render_prev_yaw + self._angle_delta_deg(sel_yaw, self._render_prev_yaw))
+        return self._render_prev_pitch, self._render_prev_roll, self._render_prev_yaw
 
     def _channel_to_norm(self, raw: int) -> float:
         clamped = max(999, min(2000, raw))
@@ -239,17 +402,54 @@ class TelemetryApp:
 
         sky = "#2b5a8a"
         ground = "#5f3f2d"
-        c.create_rectangle(0, 0, w, h / 2, fill=sky, outline="")
-        c.create_rectangle(0, h / 2, w, h, fill=ground, outline="")
+        # Draw a proper attitude sphere slice: horizon shifts with pitch and rotates with roll.
+        roll_rad = math.radians(roll)
+        pitch_px = max(-h * 0.35, min(h * 0.35, pitch * (h / 90.0) * 0.5))
+        horizon_y = cy + pitch_px
 
-        pitch_shift = max(-h * 0.25, min(h * 0.25, (pitch / 45.0) * (h * 0.25)))
-        slope = max(-1.0, min(1.0, roll / 60.0))
+        # Use an oversized world polygon and rotate it into screen space.
+        span = max(w, h) * 2.4
+        cosr = math.cos(roll_rad)
+        sinr = math.sin(roll_rad)
 
-        x0 = 0
-        y0 = cy + pitch_shift - slope * (w * 0.25)
-        x1 = w
-        y1 = cy + pitch_shift + slope * (w * 0.25)
-        c.create_line(x0, y0, x1, y1, fill="#f5f7fa", width=3)
+        def rot(x: float, y: float) -> tuple[float, float]:
+            dx = x - cx
+            dy = y - horizon_y
+            rx = dx * cosr - dy * sinr
+            ry = dx * sinr + dy * cosr
+            return cx + rx, horizon_y + ry
+
+        sky_poly_world = [
+            (cx - span, horizon_y - span),
+            (cx + span, horizon_y - span),
+            (cx + span, horizon_y),
+            (cx - span, horizon_y),
+        ]
+        ground_poly_world = [
+            (cx - span, horizon_y),
+            (cx + span, horizon_y),
+            (cx + span, horizon_y + span),
+            (cx - span, horizon_y + span),
+        ]
+        sky_poly = [coord for p in sky_poly_world for coord in rot(*p)]
+        ground_poly = [coord for p in ground_poly_world for coord in rot(*p)]
+
+        c.create_polygon(sky_poly, fill=sky, outline="")
+        c.create_polygon(ground_poly, fill=ground, outline="")
+
+        # Horizon line
+        hx0, hy0 = rot(cx - span, horizon_y)
+        hx1, hy1 = rot(cx + span, horizon_y)
+        c.create_line(hx0, hy0, hx1, hy1, fill="#f5f7fa", width=3)
+
+        # Pitch ladder every 10 degrees around center.
+        for deg in range(-30, 31, 10):
+            if deg == 0:
+                continue
+            y_off = (deg / 45.0) * (h * 0.25)
+            lx0, ly0 = rot(cx - 38, horizon_y + y_off)
+            lx1, ly1 = rot(cx + 38, horizon_y + y_off)
+            c.create_line(lx0, ly0, lx1, ly1, fill="#dbeafe", width=2)
 
         # Crosshair
         c.create_line(cx - 40, cy, cx + 40, cy, fill="#e5e7eb", width=2)
@@ -377,21 +577,34 @@ class TelemetryApp:
 
         def rotate(v: tuple[float, float, float]) -> tuple[float, float, float]:
             x, y, z = v
-            # X (roll)
-            y, z = y * cr - z * sr, y * sr + z * cr
-            # Y (pitch)
-            x, z = x * cp + z * sp, -x * sp + z * cp
-            # Z (yaw)
-            x, y = x * cyaw - y * syaw, x * syaw + y * cyaw
-            return x, y, z
+            # Direct ZYX (yaw-pitch-roll) rotation matrix application.
+            # This matches the firmware/Fusion Euler convention and avoids axis swap at non-zero yaw.
+            r00 = cyaw * cp
+            r01 = cyaw * sp * sr - syaw * cr
+            r02 = cyaw * sp * cr + syaw * sr
+            r10 = syaw * cp
+            r11 = syaw * sp * sr + cyaw * cr
+            r12 = syaw * sp * cr - cyaw * sr
+            r20 = -sp
+            r21 = cp * sr
+            r22 = cp * cr
+
+            xr = r00 * x + r01 * y + r02 * z
+            yr = r10 * x + r11 * y + r12 * z
+            zr = r20 * x + r21 * y + r22 * z
+            return xr, yr, zr
 
         def project(v: tuple[float, float, float]) -> tuple[float, float, float]:
             x, y, z = v
+            # Display mapping so zero attitude appears flat and +X points into screen.
+            x_view = y
+            y_view = z
+            z_view = -x
             dist = 420.0
-            scale = dist / (dist - z)
-            sx = cx + x * scale * 1.2
-            sy = cy - y * scale * 1.2
-            return sx, sy, z
+            scale = dist / (dist - z_view)
+            sx = cx + x_view * scale * 1.2
+            sy = cy - y_view * scale * 1.2
+            return sx, sy, z_view
 
         rverts = [project(rotate(v)) for v in verts]
         rarrow = [project(rotate(v)) for v in arrow]
@@ -449,6 +662,60 @@ class TelemetryApp:
             text=f"P {pitch:+6.2f}  R {roll:+6.2f}  Y {yaw:+6.2f}",
         )
 
+    @staticmethod
+    def _apply_alignment(x: float, y: float, z: float) -> tuple[float, float, float]:
+        # Must match firmware IMU_SENSOR_ALIGNMENT = IMU_ALIGN_CW270.
+        return -y, x, z
+
+    def _compute_fusion_euler(self, snapshot: TelemetryState) -> tuple[float, float, float] | None:
+        if (not self._fusion_ready) or (self._fusion_ahrs is None) or (self._fusion_bias is None) or (np is None):
+            return None
+
+        now = time.monotonic()
+        if self._fusion_last_monotonic <= 0.0:
+            dt = 0.01
+        else:
+            dt = now - self._fusion_last_monotonic
+            if dt < 0.001:
+                dt = 0.001
+            elif dt > 0.05:
+                dt = 0.05
+        self._fusion_last_monotonic = now
+
+        gx_dps = snapshot.gx * IMU_GYRO_DPS_PER_LSB
+        gy_dps = snapshot.gy * IMU_GYRO_DPS_PER_LSB
+        gz_dps = snapshot.gz * IMU_GYRO_DPS_PER_LSB
+        ax_g = snapshot.ax / IMU_ACCEL_LSB_PER_G
+        ay_g = snapshot.ay / IMU_ACCEL_LSB_PER_G
+        az_g = snapshot.az / IMU_ACCEL_LSB_PER_G
+
+        gx_aligned, gy_aligned, gz_aligned = self._apply_alignment(gx_dps, gy_dps, gz_dps)
+        ax_aligned, ay_aligned, az_aligned = self._apply_alignment(ax_g, ay_g, az_g)
+
+        gyro_input = np.array([gx_aligned, gy_aligned, gz_aligned], dtype=float)
+        accel_input = np.array([ax_aligned, ay_aligned, az_aligned], dtype=float)
+
+        gyro = self._fusion_bias.update(gyro_input)
+        self._fusion_ahrs.update_no_magnetometer(gyro, accel_input, dt)
+        q = self._fusion_ahrs.quaternion
+        if hasattr(q, "to_euler"):
+            euler = q.to_euler()
+            return float(euler[1]), float(-euler[0]), float(euler[2])
+
+        if hasattr(imufusion, "quaternion_to_euler"):
+            euler = imufusion.quaternion_to_euler(q)
+            return float(euler[1]), float(-euler[0]), float(euler[2])
+
+        # Last-resort conversion from quaternion elements.
+        qw = float(q.w)
+        qx = float(q.x)
+        qy = float(q.y)
+        qz = float(q.z)
+        roll = math.degrees(math.atan2(qy * qz + qw * qx, qw * qw + qz * qz - 0.5))
+        pitch = math.degrees(math.asin(max(-1.0, min(1.0, 2.0 * (qw * qy - qx * qz)))))
+        yaw = math.degrees(math.atan2(qx * qy + qw * qz, qw * qw + qx * qx - 0.5))
+        return float(pitch), float(-roll), float(yaw)
+
     def update(self) -> None:
         with self.lock:
             snapshot = TelemetryState(
@@ -466,20 +733,39 @@ class TelemetryApp:
                 rc_frames=self.state.rc_frames,
                 channels=list(self.state.channels),
                 last_update_monotonic=self.state.last_update_monotonic,
+                connected=self.state.connected,
+                port_name=self.state.port_name,
+                status_text=self.state.status_text,
             )
 
         age_ms = (time.monotonic() - snapshot.last_update_monotonic) * 1000.0 if snapshot.last_update_monotonic else -1.0
         link = "OK" if snapshot.rc_link_ok else "--"
+        ser = "UP" if snapshot.connected else "DN"
+        port = snapshot.port_name if snapshot.port_name else "n/a"
         self.header_var.set(
-            f"SEQ {snapshot.sequence:06d}   RC {link}   RF {snapshot.rc_frames:6d}   Age {age_ms:6.1f} ms"
+            f"SEQ {snapshot.sequence:06d}   RC {link}   RF {snapshot.rc_frames:6d}   "
+            f"SER {ser} ({port})   Age {age_ms:6.1f} ms"
         )
         self.imu_var.set(
             f"GX {snapshot.gx:6d}  GY {snapshot.gy:6d}  GZ {snapshot.gz:6d}    "
             f"AX {snapshot.ax:6d}  AY {snapshot.ay:6d}  AZ {snapshot.az:6d}"
         )
-        self.footer_var.set("Scale: channels map 999..2000 to -1..+1")
+        fusion_label = "FusionGUI:ON" if self._fusion_ready else "FusionGUI:OFF"
+        if (not self._fusion_ready) and imufusion_error:
+            fusion_label = f"{fusion_label} ({imufusion_error})"
+        self.footer_var.set(f"{snapshot.status_text} | {fusion_label} | Scale: channels map 999..2000 to -1..+1")
 
-        self._draw_attitude(snapshot.pitch_deg, snapshot.roll_deg, snapshot.yaw_deg)
+        fusion_euler = self._compute_fusion_euler(snapshot)
+        if fusion_euler is not None:
+            source_pitch, source_roll, source_yaw = fusion_euler
+        else:
+            source_pitch, source_roll, source_yaw = snapshot.pitch_deg, snapshot.roll_deg, snapshot.yaw_deg
+
+        render_pitch, render_roll, render_yaw = self._select_continuous_euler(
+            source_pitch, source_roll, source_yaw
+        )
+
+        self._draw_attitude(render_pitch, render_roll, render_yaw)
         self._draw_sticks(snapshot.channels)
         self._draw_board_3d(snapshot.pitch_deg, snapshot.roll_deg, snapshot.yaw_deg)
         self._draw_channels(snapshot.channels)

@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include "usbd_cdc_if.h"
+#include "Fusion.h"
 
 /* USER CODE END Includes */
 
@@ -121,6 +122,8 @@ static float g_q0 = 1.0f;
 static float g_q1 = 0.0f;
 static float g_q2 = 0.0f;
 static float g_q3 = 0.0f;
+static FusionAhrs g_fusion_ahrs;
+static uint8_t g_fusion_ready = 0U;
 
 static uint8_t g_imu_spi_mode = 3U; /* 3=mode3, 0=mode0 */
 static uint8_t g_usb_ready = 0U;
@@ -193,6 +196,9 @@ static void IMU_SpiDelay(void);
 static void IMU_CalibrateGyro(void);
 static void IMU_CalibrateLevel(void);
 static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax, int16_t ay, int16_t az);
+static void IMU_InitFusion(void);
+static float IMU_WrapAngleDeg(float angle_deg);
+static float IMU_SanitizeAngleDeg(float angle_deg, float fallback_deg);
 static uint8_t IMU_TryBringup(void);
 static void CRSF_ProcessUart(void);
 static void CRSF_HandleFrame(const uint8_t *frame, uint8_t frame_len);
@@ -259,6 +265,53 @@ static void IMU_SetQuaternionFromEuler(float roll_deg, float pitch_deg, float ya
   g_q1 = sr * cp * cy - cr * sp * sy;
   g_q2 = cr * sp * cy + sr * cp * sy;
   g_q3 = cr * cp * sy - sr * sp * cy;
+}
+
+static void IMU_InitFusion(void)
+{
+  FusionAhrsSettings settings;
+  FusionQuaternion initial_quaternion;
+
+  FusionAhrsInitialise(&g_fusion_ahrs);
+
+  settings = fusionAhrsDefaultSettings;
+  settings.convention = FusionConventionNwu;
+  settings.gain = 0.45f;
+  settings.gyroscopeRange = 2000.0f;
+  settings.accelerationRejection = 90.0f;
+  settings.magneticRejection = 0.0f;
+  settings.recoveryTriggerPeriod = 100U;
+  FusionAhrsSetSettings(&g_fusion_ahrs, &settings);
+
+  initial_quaternion.element.w = g_q0;
+  initial_quaternion.element.x = g_q1;
+  initial_quaternion.element.y = g_q2;
+  initial_quaternion.element.z = g_q3;
+  FusionAhrsSetQuaternion(&g_fusion_ahrs, initial_quaternion);
+
+  g_fusion_ready = 1U;
+}
+
+static float IMU_WrapAngleDeg(float angle_deg)
+{
+  while (angle_deg > 180.0f)
+  {
+    angle_deg -= 360.0f;
+  }
+  while (angle_deg < -180.0f)
+  {
+    angle_deg += 360.0f;
+  }
+  return angle_deg;
+}
+
+static float IMU_SanitizeAngleDeg(float angle_deg, float fallback_deg)
+{
+  if (!isfinite(angle_deg))
+  {
+    return fallback_deg;
+  }
+  return IMU_WrapAngleDeg(angle_deg);
 }
 
 /* USER CODE END 0 */
@@ -1015,6 +1068,7 @@ static uint8_t IMU_TryBringup(void)
   IMU_CalibrateGyro();
   HAL_Delay(100);
   IMU_CalibrateLevel();
+  IMU_InitFusion();
   HAL_Delay(500);
 
   return 1U;
@@ -1256,7 +1310,7 @@ static void IMU_CalibrateLevel(void)
       
       /* Tilt-stable accel angles: minimizes roll/pitch cross-coupling near ±90 deg pitch. */
       float accel_pitch = atan2f(-ax_aligned, sqrtf((ay_aligned * ay_aligned) + (az_aligned * az_aligned))) * 180.0f / 3.14159265f;
-      float accel_roll = atan2f(ay_aligned, az_aligned) * 180.0f / 3.14159265f;
+      float accel_roll = -atan2f(ay_aligned, az_aligned) * 180.0f / 3.14159265f;
       
       sum_pitch += accel_pitch;
       sum_roll += accel_roll;
@@ -1283,8 +1337,6 @@ static void IMU_CalibrateLevel(void)
 static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax, int16_t ay, int16_t az)
 {
   static uint32_t s_last_update_ms = 0U;
-  static float s_err_int_x = 0.0f;
-  static float s_err_int_y = 0.0f;
   uint32_t now_ms = HAL_GetTick();
   float dt = 0.01f;
 
@@ -1324,11 +1376,6 @@ static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax
   float gz_aligned = 0.0f;
 
   IMU_ApplyAlignment(gx_dps, gy_dps, gz_dps, &gx_aligned, &gy_aligned, &gz_aligned);
-
-  /* Body rates in rad/s (p,q,r). */
-  float p = gx_aligned * 3.14159265f / 180.0f;
-  float q = gy_aligned * 3.14159265f / 180.0f;
-  float r = gz_aligned * 3.14159265f / 180.0f;
   
   /* Convert accel to g units (±16g range) */
   float ax_g = (float)ax / IMU_ACCEL_LSB_PER_G;
@@ -1339,91 +1386,58 @@ static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax
   float az_aligned = 0.0f;
 
   IMU_ApplyAlignment(ax_g, ay_g, az_g, &ax_aligned, &ay_aligned, &az_aligned);
-  
-  /* Quaternion Mahony-style correction avoids Euler singularities near vertical pitch. */
-  const float kp = 2.2f;
-  const float ki = 0.08f;
 
-  const float acc_norm = sqrtf((ax_aligned * ax_aligned) + (ay_aligned * ay_aligned) + (az_aligned * az_aligned));
-  /* Use accel correction only when acceleration is near 1g to avoid dynamic-motion corruption. */
-  if ((acc_norm > 0.7f) && (acc_norm < 1.3f))
+  if (g_fusion_ready == 0U)
   {
-    const float axn = ax_aligned / acc_norm;
-    const float ayn = ay_aligned / acc_norm;
-    const float azn = az_aligned / acc_norm;
-    float acc_trust = 1.0f - (fabsf(acc_norm - 1.0f) / 0.3f);
-    if (acc_trust < 0.0f)
+    IMU_InitFusion();
+  }
+
+  {
+    FusionVector gyro_vector;
+    FusionVector accel_vector;
+    FusionQuaternion q;
+    FusionEuler euler;
+    float roll_next;
+    float pitch_next;
+    float yaw_next;
+
+    gyro_vector.axis.x = gx_aligned;
+    gyro_vector.axis.y = gy_aligned;
+    gyro_vector.axis.z = gz_aligned;
+
+    accel_vector.axis.x = ax_aligned;
+    accel_vector.axis.y = ay_aligned;
+    accel_vector.axis.z = az_aligned;
+
+    FusionAhrsUpdateNoMagnetometer(&g_fusion_ahrs, gyro_vector, accel_vector, dt);
+
+    q = FusionAhrsGetQuaternion(&g_fusion_ahrs);
+
+    if ((!isfinite(q.element.w)) || (!isfinite(q.element.x)) || (!isfinite(q.element.y)) || (!isfinite(q.element.z)))
     {
-      acc_trust = 0.0f;
-    }
-    if (acc_trust > 1.0f)
-    {
-      acc_trust = 1.0f;
+      /* Recover from rare AHRS numerical fault without corrupting telemetry stream. */
+      IMU_InitFusion();
+      q = FusionAhrsGetQuaternion(&g_fusion_ahrs);
     }
 
-    const float vx = 2.0f * (g_q1 * g_q3 - g_q0 * g_q2);
-    const float vy = 2.0f * (g_q0 * g_q1 + g_q2 * g_q3);
-    const float vz = g_q0 * g_q0 - g_q1 * g_q1 - g_q2 * g_q2 + g_q3 * g_q3;
+    g_q0 = q.element.w;
+    g_q1 = q.element.x;
+    g_q2 = q.element.y;
+    g_q3 = q.element.z;
 
-    const float ex = (ayn * vz - azn * vy);
-    const float ey = (azn * vx - axn * vz);
-    s_err_int_x += ex * dt;
-    s_err_int_y += ey * dt;
+    euler = FusionQuaternionToEuler(q);
+    roll_next = IMU_SanitizeAngleDeg(-euler.angle.roll, g_roll_fused);
+    pitch_next = IMU_SanitizeAngleDeg(euler.angle.pitch, g_pitch_fused);
+    yaw_next = IMU_SanitizeAngleDeg(euler.angle.yaw, g_yaw_fused);
 
-    /* Bound integral term to prevent windup during aggressive maneuvers. */
-    if (s_err_int_x > 0.5f) s_err_int_x = 0.5f;
-    if (s_err_int_x < -0.5f) s_err_int_x = -0.5f;
-    if (s_err_int_y > 0.5f) s_err_int_y = 0.5f;
-    if (s_err_int_y < -0.5f) s_err_int_y = -0.5f;
-
-    p += (kp * acc_trust) * ex;
-    q += (kp * acc_trust) * ey;
-
-    p += (ki * acc_trust) * s_err_int_x;
-    q += (ki * acc_trust) * s_err_int_y;
-  }
-  else
-  {
-    /* Mild decay when accel is not trusted. */
-    s_err_int_x *= 0.995f;
-    s_err_int_y *= 0.995f;
+    g_roll_fused = roll_next;
+    g_pitch_fused = pitch_next;
+    g_yaw_fused = yaw_next;
   }
 
-  const float qDot0 = 0.5f * (-g_q1 * p - g_q2 * q - g_q3 * r);
-  const float qDot1 = 0.5f * ( g_q0 * p + g_q2 * r - g_q3 * q);
-  const float qDot2 = 0.5f * ( g_q0 * q - g_q1 * r + g_q3 * p);
-  const float qDot3 = 0.5f * ( g_q0 * r + g_q1 * q - g_q2 * p);
-
-  g_q0 += qDot0 * dt;
-  g_q1 += qDot1 * dt;
-  g_q2 += qDot2 * dt;
-  g_q3 += qDot3 * dt;
-
-  const float qn = sqrtf(g_q0 * g_q0 + g_q1 * g_q1 + g_q2 * g_q2 + g_q3 * g_q3);
-  if (qn > 1e-6f)
-  {
-    g_q0 /= qn;
-    g_q1 /= qn;
-    g_q2 /= qn;
-    g_q3 /= qn;
-  }
-
-  const float sinp = 2.0f * (g_q0 * g_q2 - g_q3 * g_q1);
-  const float sinp_clamped = (sinp > 1.0f) ? 1.0f : ((sinp < -1.0f) ? -1.0f : sinp);
-
-  g_roll_fused = atan2f(2.0f * (g_q0 * g_q1 + g_q2 * g_q3), 1.0f - 2.0f * (g_q1 * g_q1 + g_q2 * g_q2)) * 180.0f / 3.14159265f;
-  g_pitch_fused = asinf(sinp_clamped) * 180.0f / 3.14159265f;
-  g_yaw_fused = atan2f(2.0f * (g_q0 * g_q3 + g_q1 * g_q2), 1.0f - 2.0f * (g_q2 * g_q2 + g_q3 * g_q3)) * 180.0f / 3.14159265f;
-  
-  /* Normalize pitch and roll to -180 to +180 range */
-  while (g_pitch_fused > 180.0f) g_pitch_fused -= 360.0f;
-  while (g_pitch_fused < -180.0f) g_pitch_fused += 360.0f;
-  while (g_roll_fused > 180.0f) g_roll_fused -= 360.0f;
-  while (g_roll_fused < -180.0f) g_roll_fused += 360.0f;
-  
-  /* Wrap yaw to ±180 degrees */
-  while (g_yaw_fused > 180.0f) g_yaw_fused -= 360.0f;
-  while (g_yaw_fused < -180.0f) g_yaw_fused += 360.0f;
+  g_pitch_fused = IMU_WrapAngleDeg(g_pitch_fused);
+  g_roll_fused = IMU_WrapAngleDeg(g_roll_fused);
+  g_yaw_fused = IMU_WrapAngleDeg(g_yaw_fused);
 }
 
 static uint8_t IMU_ReadRaw(int16_t *gx, int16_t *gy, int16_t *gz)
