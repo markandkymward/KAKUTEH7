@@ -1,3 +1,22 @@
 build
 mx.scratch
 !.settings
+
+# Local script artifacts
+scripts/__pycache__/
+scripts/proecapture.txt
+
+# Keep only the vendored x-io Fusion files used by firmware
+third_party/Fusion/*
+!third_party/Fusion/Fusion/
+third_party/Fusion/Fusion/*
+!third_party/Fusion/Fusion/Fusion.h
+!third_party/Fusion/Fusion/FusionAhrs.c
+!third_party/Fusion/Fusion/FusionAhrs.h
+!third_party/Fusion/Fusion/FusionBias.h
+!third_party/Fusion/Fusion/FusionCompass.h
+!third_party/Fusion/Fusion/FusionConvention.h
+!third_party/Fusion/Fusion/FusionMath.h
+!third_party/Fusion/Fusion/FusionModel.h
+!third_party/Fusion/Fusion/FusionRemap.h
+!third_party/Fusion/LICENSE.md
