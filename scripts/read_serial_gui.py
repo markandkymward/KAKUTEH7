@@ -48,8 +48,8 @@ except Exception as exc:  # pragma: no cover
 SOF1 = 0xA5
 SOF2 = 0x5A
 PACKET_TYPE_TELEMETRY = 0x01
-TELEMETRY_PAYLOAD_LEN = 65
-TELEMETRY_STRUCT = struct.Struct("<Iiii6hBI16H")
+TELEMETRY_PAYLOAD_LEN = 73
+TELEMETRY_STRUCT = struct.Struct("<Iiii6hBIIi16H")
 IMU_ACCEL_LSB_PER_G = 2048.0
 IMU_GYRO_DPS_PER_LSB = 2000.0 / 32768.0
 
@@ -129,6 +129,8 @@ class TelemetryState:
     ax: int = 0
     ay: int = 0
     az: int = 0
+    pressure_pa: int = 0
+    altitude_cm: int = 0
     rc_link_ok: bool = False
     rc_frames: int = 0
     channels: list[int] = field(default_factory=lambda: [0] * 16)
@@ -211,6 +213,8 @@ class SerialReader(threading.Thread):
                                     az,
                                     rc_link,
                                     rc_frames,
+                                    pressure_pa,
+                                    altitude_cm,
                                     *channels,
                                 ) = values
 
@@ -225,6 +229,8 @@ class SerialReader(threading.Thread):
                                     self.state.ax = int(ax)
                                     self.state.ay = int(ay)
                                     self.state.az = int(az)
+                                    self.state.pressure_pa = int(pressure_pa)
+                                    self.state.altitude_cm = int(altitude_cm)
                                     self.state.rc_link_ok = bool(rc_link)
                                     self.state.rc_frames = int(rc_frames)
                                     self.state.channels = [int(v) for v in channels]
@@ -264,11 +270,13 @@ class TelemetryApp:
 
         self.header_var = tk.StringVar(value="Waiting for data...")
         self.imu_var = tk.StringVar(value="")
+        self.baro_var = tk.StringVar(value="")
 
         header = ttk.Frame(root, padding=10)
         header.pack(fill=tk.X)
         ttk.Label(header, textvariable=self.header_var, font=("Segoe UI", 13, "bold")).pack(anchor=tk.W)
         ttk.Label(header, textvariable=self.imu_var, font=("Consolas", 11)).pack(anchor=tk.W)
+        ttk.Label(header, textvariable=self.baro_var, font=("Consolas", 11)).pack(anchor=tk.W)
 
         body = ttk.Frame(root, padding=(10, 0, 10, 10))
         body.pack(fill=tk.BOTH, expand=True)
@@ -522,7 +530,7 @@ class TelemetryApp:
 
             c.create_text(right + 6, y + 8, anchor="w", fill="#cbd5e1", font=("Consolas", 10), text=f"{raw:4d}")
 
-    def _draw_board_3d(self, pitch: float, roll: float, yaw: float) -> None:
+    def _draw_board_3d(self, pitch: float, roll: float, yaw: float, quaternion=None) -> None:
         c = self.board3d_canvas
         c.delete("all")
         w = c.winfo_width()
@@ -564,19 +572,33 @@ class TelemetryApp:
         axis_y = (0.0, axis_len, 0.0)
         axis_z = (0.0, 0.0, axis_len)
 
-        pr = math.radians(pitch)
-        rr = math.radians(roll)
-        yr = math.radians(yaw)
+        if quaternion is not None:
+            qw = float(quaternion.w)
+            qx = float(quaternion.x)
+            qy = float(quaternion.y)
+            qz = float(quaternion.z)
 
-        cp = math.cos(pr)
-        sp = math.sin(pr)
-        cr = math.cos(rr)
-        sr = math.sin(rr)
-        cyaw = math.cos(yr)
-        syaw = math.sin(yr)
+            r00 = 1.0 - 2.0 * (qy * qy + qz * qz)
+            r01 = 2.0 * (qx * qy - qz * qw)
+            r02 = 2.0 * (qx * qz + qy * qw)
+            r10 = 2.0 * (qx * qy + qz * qw)
+            r11 = 1.0 - 2.0 * (qx * qx + qz * qz)
+            r12 = 2.0 * (qy * qz - qx * qw)
+            r20 = 2.0 * (qx * qz - qy * qw)
+            r21 = 2.0 * (qy * qz + qx * qw)
+            r22 = 1.0 - 2.0 * (qx * qx + qy * qy)
+        else:
+            pr = math.radians(pitch)
+            rr = math.radians(roll)
+            yr = math.radians(yaw)
 
-        def rotate(v: tuple[float, float, float]) -> tuple[float, float, float]:
-            x, y, z = v
+            cp = math.cos(pr)
+            sp = math.sin(pr)
+            cr = math.cos(rr)
+            sr = math.sin(rr)
+            cyaw = math.cos(yr)
+            syaw = math.sin(yr)
+
             # Direct ZYX (yaw-pitch-roll) rotation matrix application.
             # This matches the firmware/Fusion Euler convention and avoids axis swap at non-zero yaw.
             r00 = cyaw * cp
@@ -589,6 +611,8 @@ class TelemetryApp:
             r21 = cp * sr
             r22 = cp * cr
 
+        def rotate(v: tuple[float, float, float]) -> tuple[float, float, float]:
+            x, y, z = v
             xr = r00 * x + r01 * y + r02 * z
             yr = r10 * x + r11 * y + r12 * z
             zr = r20 * x + r21 * y + r22 * z
@@ -716,6 +740,57 @@ class TelemetryApp:
         yaw = math.degrees(math.atan2(qx * qy + qw * qz, qw * qw + qx * qx - 0.5))
         return float(pitch), float(-roll), float(yaw)
 
+    def _compute_fusion_quaternion(self, snapshot: TelemetryState):
+        if (not self._fusion_ready) or (self._fusion_ahrs is None) or (self._fusion_bias is None) or (np is None):
+            return None
+
+        now = time.monotonic()
+        if self._fusion_last_monotonic <= 0.0:
+            dt = 0.01
+        else:
+            dt = now - self._fusion_last_monotonic
+            if dt < 0.001:
+                dt = 0.001
+            elif dt > 0.05:
+                dt = 0.05
+        self._fusion_last_monotonic = now
+
+        gx_dps = snapshot.gx * IMU_GYRO_DPS_PER_LSB
+        gy_dps = snapshot.gy * IMU_GYRO_DPS_PER_LSB
+        gz_dps = snapshot.gz * IMU_GYRO_DPS_PER_LSB
+        ax_g = snapshot.ax / IMU_ACCEL_LSB_PER_G
+        ay_g = snapshot.ay / IMU_ACCEL_LSB_PER_G
+        az_g = snapshot.az / IMU_ACCEL_LSB_PER_G
+
+        gx_aligned, gy_aligned, gz_aligned = self._apply_alignment(gx_dps, gy_dps, gz_dps)
+        ax_aligned, ay_aligned, az_aligned = self._apply_alignment(ax_g, ay_g, az_g)
+
+        gyro_input = np.array([gx_aligned, gy_aligned, gz_aligned], dtype=float)
+        accel_input = np.array([ax_aligned, ay_aligned, az_aligned], dtype=float)
+
+        gyro = self._fusion_bias.update(gyro_input)
+        self._fusion_ahrs.update_no_magnetometer(gyro, accel_input, dt)
+        return self._fusion_ahrs.quaternion
+
+    @staticmethod
+    def _quaternion_to_euler_display(q) -> tuple[float, float, float]:
+        if hasattr(q, "to_euler"):
+            euler = q.to_euler()
+            return float(euler[1]), float(-euler[0]), float(euler[2])
+
+        if hasattr(imufusion, "quaternion_to_euler"):
+            euler = imufusion.quaternion_to_euler(q)
+            return float(euler[1]), float(-euler[0]), float(euler[2])
+
+        qw = float(q.w)
+        qx = float(q.x)
+        qy = float(q.y)
+        qz = float(q.z)
+        roll = math.degrees(math.atan2(qy * qz + qw * qx, qw * qw + qz * qz - 0.5))
+        pitch = math.degrees(math.asin(max(-1.0, min(1.0, 2.0 * (qw * qy - qx * qz)))))
+        yaw = math.degrees(math.atan2(qx * qy + qw * qz, qw * qw + qx * qx - 0.5))
+        return float(pitch), float(-roll), float(yaw)
+
     def update(self) -> None:
         with self.lock:
             snapshot = TelemetryState(
@@ -729,6 +804,8 @@ class TelemetryApp:
                 ax=self.state.ax,
                 ay=self.state.ay,
                 az=self.state.az,
+                pressure_pa=self.state.pressure_pa,
+                altitude_cm=self.state.altitude_cm,
                 rc_link_ok=self.state.rc_link_ok,
                 rc_frames=self.state.rc_frames,
                 channels=list(self.state.channels),
@@ -750,14 +827,17 @@ class TelemetryApp:
             f"GX {snapshot.gx:6d}  GY {snapshot.gy:6d}  GZ {snapshot.gz:6d}    "
             f"AX {snapshot.ax:6d}  AY {snapshot.ay:6d}  AZ {snapshot.az:6d}"
         )
+        self.baro_var.set(
+            f"BARO P {snapshot.pressure_pa:7d} Pa   ALT {snapshot.altitude_cm / 100.0:+7.2f} m"
+        )
         fusion_label = "FusionGUI:ON" if self._fusion_ready else "FusionGUI:OFF"
         if (not self._fusion_ready) and imufusion_error:
             fusion_label = f"{fusion_label} ({imufusion_error})"
         self.footer_var.set(f"{snapshot.status_text} | {fusion_label} | Scale: channels map 999..2000 to -1..+1")
 
-        fusion_euler = self._compute_fusion_euler(snapshot)
-        if fusion_euler is not None:
-            source_pitch, source_roll, source_yaw = fusion_euler
+        fusion_quaternion = self._compute_fusion_quaternion(snapshot)
+        if fusion_quaternion is not None:
+            source_pitch, source_roll, source_yaw = self._quaternion_to_euler_display(fusion_quaternion)
         else:
             source_pitch, source_roll, source_yaw = snapshot.pitch_deg, snapshot.roll_deg, snapshot.yaw_deg
 
@@ -767,7 +847,7 @@ class TelemetryApp:
 
         self._draw_attitude(render_pitch, render_roll, render_yaw)
         self._draw_sticks(snapshot.channels)
-        self._draw_board_3d(snapshot.pitch_deg, snapshot.roll_deg, snapshot.yaw_deg)
+        self._draw_board_3d(render_pitch, render_roll, render_yaw, fusion_quaternion)
         self._draw_channels(snapshot.channels)
 
         self.root.after(33, self.update)

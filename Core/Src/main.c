@@ -90,6 +90,7 @@
 UART_HandleTypeDef huart4;
 UART_HandleTypeDef huart5;
 UART_HandleTypeDef huart1;
+I2C_HandleTypeDef hi2c1;
 
 /* USER CODE BEGIN PV */
 
@@ -129,6 +130,28 @@ static uint8_t g_imu_spi_mode = 3U; /* 3=mode3, 0=mode0 */
 static uint8_t g_usb_ready = 0U;
 static uint32_t g_telemetry_sequence = 0U;
 
+static uint8_t g_bmp280_found = 0U;
+static uint8_t g_bmp280_addr = 0x76U;
+static uint32_t g_baro_pressure_pa = 101325U;
+static int32_t g_baro_altitude_cm = 0;
+static float g_baro_reference_pressure_pa = 101325.0f;
+static int32_t g_baro_temp_raw = 0;
+static int32_t g_baro_press_raw = 0;
+static int32_t g_baro_t_fine = 0;
+
+static uint16_t g_bmp280_dig_t1 = 0U;
+static int16_t g_bmp280_dig_t2 = 0;
+static int16_t g_bmp280_dig_t3 = 0;
+static uint16_t g_bmp280_dig_p1 = 0U;
+static int16_t g_bmp280_dig_p2 = 0;
+static int16_t g_bmp280_dig_p3 = 0;
+static int16_t g_bmp280_dig_p4 = 0;
+static int16_t g_bmp280_dig_p5 = 0;
+static int16_t g_bmp280_dig_p6 = 0;
+static int16_t g_bmp280_dig_p7 = 0;
+static int16_t g_bmp280_dig_p8 = 0;
+static int16_t g_bmp280_dig_p9 = 0;
+
 static volatile uint16_t g_rc_channels_raw[CRSF_RC_CHANNEL_COUNT] = {0U};
 static volatile uint16_t g_rc_channels_us[CRSF_RC_CHANNEL_COUNT] = {
   1500U, 1500U, 1000U, 1500U,
@@ -165,7 +188,17 @@ static volatile uint32_t g_crsf_last_isr_byte_ms = 0U;
 #define TELEMETRY_PACKET_SOF1           0xA5U
 #define TELEMETRY_PACKET_SOF2           0x5AU
 #define TELEMETRY_PACKET_TYPE_TELEMETRY  0x01U
-#define TELEMETRY_PACKET_PAYLOAD_BYTES   65U
+#define TELEMETRY_PACKET_PAYLOAD_BYTES   73U
+
+#define BMP280_I2C_TIMEOUT_MS           20U
+#define BMP280_REG_ID                   0xD0U
+#define BMP280_REG_RESET                0xE0U
+#define BMP280_REG_STATUS               0xF3U
+#define BMP280_REG_CTRL_MEAS            0xF4U
+#define BMP280_REG_CONFIG               0xF5U
+#define BMP280_REG_PRESS_MSB            0xF7U
+#define BMP280_REG_CALIB_START          0x88U
+#define BMP280_CHIP_ID                  0x58U
 
 /* USER CODE END PV */
 
@@ -173,6 +206,7 @@ static volatile uint32_t g_crsf_last_isr_byte_ms = 0U;
 void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
 static void MX_UART5_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_UART4_Init(void);
@@ -180,7 +214,8 @@ static void MX_UART4_Init(void);
 static uint8_t MX_SPI4_Init(void);
 static void Telemetry_SendPacket(int32_t pitch_cd, int32_t roll_cd, int32_t yaw_cd,
                                  int16_t gx_raw, int16_t gy_raw, int16_t gz_raw,
-                                 int16_t ax_raw, int16_t ay_raw, int16_t az_raw);
+                                 int16_t ax_raw, int16_t ay_raw, int16_t az_raw,
+                                 uint32_t pressure_pa, int32_t altitude_cm);
 static uint8_t IMU_Probe(void);
 static uint8_t IMU_ReadWhoAmI(uint8_t reg, uint8_t *whoami);
 static uint8_t IMU_ReadReg(uint8_t reg, uint8_t *value);
@@ -199,6 +234,11 @@ static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax
 static void IMU_InitFusion(void);
 static float IMU_WrapAngleDeg(float angle_deg);
 static float IMU_SanitizeAngleDeg(float angle_deg, float fallback_deg);
+static uint8_t BMP280_Init(void);
+static uint8_t BMP280_Update(void);
+static HAL_StatusTypeDef BMP280_ReadRegs(uint8_t reg, uint8_t *data, uint16_t len);
+static HAL_StatusTypeDef BMP280_WriteReg(uint8_t reg, uint8_t value);
+static float BMP280_PressureToAltitudeCm(float pressure_pa, float reference_pressure_pa);
 static uint8_t IMU_TryBringup(void);
 static void CRSF_ProcessUart(void);
 static void CRSF_HandleFrame(const uint8_t *frame, uint8_t frame_len);
@@ -348,19 +388,25 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_I2C1_Init();
   MX_UART5_Init();
   MX_USART1_UART_Init();
   MX_USB_DEVICE_Init();
   MX_UART4_Init();
   /* USER CODE BEGIN 2 */
   uint32_t next_imu_probe_ms = 0U;
+  uint32_t next_baro_probe_ms = 0U;
+  uint32_t next_baro_update_ms = 0U;
   uint32_t now_ms = 0U;
   uint32_t next_telemetry_ms = 0U;
 
   g_usb_ready = 1U;
 
   (void)IMU_TryBringup();
+  (void)BMP280_Init();
   next_imu_probe_ms = HAL_GetTick() + 500U;
+  next_baro_probe_ms = HAL_GetTick() + 1000U;
+  next_baro_update_ms = HAL_GetTick();
   next_telemetry_ms = HAL_GetTick();
 
   if (HAL_UART_Receive_IT(&huart4, &g_uart4_rx_byte, 1U) != HAL_OK)
@@ -404,6 +450,26 @@ int main(void)
       next_imu_probe_ms = HAL_GetTick() + 500U;
     }
 
+    if ((g_bmp280_found == 0U) && (HAL_GetTick() >= next_baro_probe_ms))
+    {
+      (void)BMP280_Init();
+      next_baro_probe_ms = HAL_GetTick() + 1000U;
+      next_baro_update_ms = HAL_GetTick();
+    }
+
+    if ((g_bmp280_found != 0U) && (HAL_GetTick() >= next_baro_update_ms))
+    {
+      if (BMP280_Update() == 0U)
+      {
+        g_bmp280_found = 0U;
+        next_baro_probe_ms = HAL_GetTick() + 1000U;
+      }
+      else
+      {
+        next_baro_update_ms = HAL_GetTick() + 25U;
+      }
+    }
+
     if (g_imu_found)
     {
       uint8_t gyro_ok = IMU_ReadRaw(&gyro_x, &gyro_y, &gyro_z);
@@ -441,7 +507,9 @@ int main(void)
                            gyro_z,
                            accel_x,
                            accel_y,
-                           accel_z);
+                           accel_z,
+                           g_baro_pressure_pa,
+                           g_baro_altitude_cm);
       next_telemetry_ms = now_ms + 10U;
     }
   }
@@ -725,6 +793,38 @@ void SystemClock_Config(void)
   * @param None
   * @retval None
   */
+static void MX_I2C1_Init(void)
+{
+
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.Timing = 0x10909CECU;
+  hi2c1.Init.OwnAddress1 = 0U;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0U;
+  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0U) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief UART4 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_UART4_Init(void)
 {
 
@@ -969,7 +1069,8 @@ static void Packet_PutS32LE(uint8_t *dst, int32_t value)
 
 static void Telemetry_SendPacket(int32_t pitch_cd, int32_t roll_cd, int32_t yaw_cd,
                                  int16_t gx_raw, int16_t gy_raw, int16_t gz_raw,
-                                 int16_t ax_raw, int16_t ay_raw, int16_t az_raw)
+                                 int16_t ax_raw, int16_t ay_raw, int16_t az_raw,
+                                 uint32_t pressure_pa, int32_t altitude_cm)
 {
   uint8_t frame[4U + TELEMETRY_PACKET_PAYLOAD_BYTES + 1U];
   uint8_t checksum = 0U;
@@ -1009,6 +1110,12 @@ static void Telemetry_SendPacket(int32_t pitch_cd, int32_t roll_cd, int32_t yaw_
   Packet_PutU32LE(&frame[4U + payload_index], g_rc_frame_count);
   payload_index = (uint8_t)(payload_index + 4U);
 
+  Packet_PutU32LE(&frame[4U + payload_index], pressure_pa);
+  payload_index = (uint8_t)(payload_index + 4U);
+
+  Packet_PutS32LE(&frame[4U + payload_index], altitude_cm);
+  payload_index = (uint8_t)(payload_index + 4U);
+
   Packet_PutU16LE(&frame[4U + payload_index], g_rc_channels_us[0]);
   payload_index = (uint8_t)(payload_index + 2U);
   Packet_PutU16LE(&frame[4U + payload_index], g_rc_channels_us[1]);
@@ -1031,6 +1138,146 @@ static void Telemetry_SendPacket(int32_t pitch_cd, int32_t roll_cd, int32_t yaw_
   frame[4U + TELEMETRY_PACKET_PAYLOAD_BYTES] = checksum;
 
   Serial_Write(frame, (uint16_t)sizeof(frame));
+}
+
+static HAL_StatusTypeDef BMP280_ReadRegs(uint8_t reg, uint8_t *data, uint16_t len)
+{
+  if ((data == NULL) || (len == 0U))
+  {
+    return HAL_ERROR;
+  }
+
+  return HAL_I2C_Mem_Read(&hi2c1, (uint16_t)(g_bmp280_addr << 1), reg,
+                          I2C_MEMADD_SIZE_8BIT, data, len, BMP280_I2C_TIMEOUT_MS);
+}
+
+static HAL_StatusTypeDef BMP280_WriteReg(uint8_t reg, uint8_t value)
+{
+  return HAL_I2C_Mem_Write(&hi2c1, (uint16_t)(g_bmp280_addr << 1), reg,
+                           I2C_MEMADD_SIZE_8BIT, &value, 1U, BMP280_I2C_TIMEOUT_MS);
+}
+
+static float BMP280_PressureToAltitudeCm(float pressure_pa, float reference_pressure_pa)
+{
+  if ((pressure_pa <= 0.0f) || (reference_pressure_pa <= 0.0f))
+  {
+    return 0.0f;
+  }
+
+  return 4433000.0f * (1.0f - powf(pressure_pa / reference_pressure_pa, 0.1903f));
+}
+
+static uint8_t BMP280_Init(void)
+{
+  const uint8_t candidates[2] = {0x76U, 0x77U};
+  uint8_t id = 0U;
+  uint8_t calib[24] = {0U};
+
+  g_bmp280_found = 0U;
+
+  for (uint8_t i = 0U; i < 2U; i++)
+  {
+    g_bmp280_addr = candidates[i];
+    if (BMP280_ReadRegs(BMP280_REG_ID, &id, 1U) != HAL_OK)
+    {
+      continue;
+    }
+    if (id != BMP280_CHIP_ID)
+    {
+      continue;
+    }
+
+    if (BMP280_ReadRegs(BMP280_REG_CALIB_START, calib, (uint16_t)sizeof(calib)) != HAL_OK)
+    {
+      continue;
+    }
+
+    g_bmp280_dig_t1 = (uint16_t)((uint16_t)calib[0] | ((uint16_t)calib[1] << 8U));
+    g_bmp280_dig_t2 = (int16_t)((uint16_t)calib[2] | ((uint16_t)calib[3] << 8U));
+    g_bmp280_dig_t3 = (int16_t)((uint16_t)calib[4] | ((uint16_t)calib[5] << 8U));
+    g_bmp280_dig_p1 = (uint16_t)((uint16_t)calib[6] | ((uint16_t)calib[7] << 8U));
+    g_bmp280_dig_p2 = (int16_t)((uint16_t)calib[8] | ((uint16_t)calib[9] << 8U));
+    g_bmp280_dig_p3 = (int16_t)((uint16_t)calib[10] | ((uint16_t)calib[11] << 8U));
+    g_bmp280_dig_p4 = (int16_t)((uint16_t)calib[12] | ((uint16_t)calib[13] << 8U));
+    g_bmp280_dig_p5 = (int16_t)((uint16_t)calib[14] | ((uint16_t)calib[15] << 8U));
+    g_bmp280_dig_p6 = (int16_t)((uint16_t)calib[16] | ((uint16_t)calib[17] << 8U));
+    g_bmp280_dig_p7 = (int16_t)((uint16_t)calib[18] | ((uint16_t)calib[19] << 8U));
+    g_bmp280_dig_p8 = (int16_t)((uint16_t)calib[20] | ((uint16_t)calib[21] << 8U));
+    g_bmp280_dig_p9 = (int16_t)((uint16_t)calib[22] | ((uint16_t)calib[23] << 8U));
+
+    (void)BMP280_WriteReg(BMP280_REG_RESET, 0xB6U);
+    HAL_Delay(3);
+    (void)BMP280_WriteReg(BMP280_REG_CONFIG, 0x00U);
+    (void)BMP280_WriteReg(BMP280_REG_CTRL_MEAS, 0x27U); /* temp x1, press x1, normal mode */
+
+    g_bmp280_found = 1U;
+    if (BMP280_Update() == 0U)
+    {
+      g_bmp280_found = 0U;
+      continue;
+    }
+
+    g_baro_reference_pressure_pa = (float)g_baro_pressure_pa;
+    g_baro_altitude_cm = 0;
+    g_bmp280_found = 1U;
+    return 1U;
+  }
+
+  return 0U;
+}
+
+static uint8_t BMP280_Update(void)
+{
+  uint8_t data[6] = {0U};
+  int32_t adc_p = 0;
+  int32_t adc_t = 0;
+  int32_t var1 = 0;
+  int32_t var2 = 0;
+  int64_t var1_64 = 0;
+  int64_t var2_64 = 0;
+  int64_t p_64 = 0;
+
+  if (g_bmp280_found == 0U)
+  {
+    return 0U;
+  }
+
+  if (BMP280_ReadRegs(BMP280_REG_PRESS_MSB, data, (uint16_t)sizeof(data)) != HAL_OK)
+  {
+    return 0U;
+  }
+
+  adc_p = (int32_t)(((uint32_t)data[0] << 12U) | ((uint32_t)data[1] << 4U) | ((uint32_t)data[2] >> 4U));
+  adc_t = (int32_t)(((uint32_t)data[3] << 12U) | ((uint32_t)data[4] << 4U) | ((uint32_t)data[5] >> 4U));
+
+  var1 = ((((adc_t >> 3) - ((int32_t)g_bmp280_dig_t1 << 1)) * (int32_t)g_bmp280_dig_t2) >> 11);
+  var2 = (((((adc_t >> 4) - (int32_t)g_bmp280_dig_t1) * ((adc_t >> 4) - (int32_t)g_bmp280_dig_t1)) >> 12) * (int32_t)g_bmp280_dig_t3) >> 14;
+  g_baro_t_fine = var1 + var2;
+
+  var1_64 = (int64_t)g_baro_t_fine - 128000LL;
+  var2_64 = var1_64 * var1_64 * (int64_t)g_bmp280_dig_p6;
+  var2_64 = var2_64 + ((var1_64 * (int64_t)g_bmp280_dig_p5) << 17);
+  var2_64 = var2_64 + (((int64_t)g_bmp280_dig_p4) << 35);
+  var1_64 = ((var1_64 * var1_64 * (int64_t)g_bmp280_dig_p3) >> 8) + ((var1_64 * (int64_t)g_bmp280_dig_p2) << 12);
+  var1_64 = (((((int64_t)1 << 47) + var1_64) * (int64_t)g_bmp280_dig_p1) >> 33);
+
+  if (var1_64 == 0)
+  {
+    return 0U;
+  }
+
+  p_64 = (1048576LL - (int64_t)adc_p);
+  p_64 = (((p_64 << 31) - var2_64) * 3125LL) / var1_64;
+  var1_64 = (((int64_t)g_bmp280_dig_p9) * (p_64 >> 13) * (p_64 >> 13)) >> 25;
+  var2_64 = (((int64_t)g_bmp280_dig_p8) * p_64) >> 19;
+  p_64 = ((p_64 + var1_64 + var2_64) >> 8) + (((int64_t)g_bmp280_dig_p7) << 4);
+
+  g_baro_press_raw = adc_p;
+  g_baro_temp_raw = adc_t;
+  g_baro_pressure_pa = (uint32_t)((float)p_64 / 256.0f);
+  g_baro_altitude_cm = (int32_t)lroundf(BMP280_PressureToAltitudeCm((float)g_baro_pressure_pa, g_baro_reference_pressure_pa));
+
+  return 1U;
 }
 
 static uint8_t MX_SPI4_Init(void)

@@ -101,8 +101,8 @@ def _pick_port() -> str | None:
 SOF1 = 0xA5
 SOF2 = 0x5A
 PACKET_TYPE_TELEMETRY = 0x01
-TELEMETRY_PAYLOAD_LEN = 65
-TELEMETRY_STRUCT = struct.Struct("<Iiii6hBI16H")
+TELEMETRY_PAYLOAD_LEN = 73
+TELEMETRY_STRUCT = struct.Struct("<Iiii6hBIIi16H")
 
 
 def _checksum(packet_type: int, payload: bytes) -> int:
@@ -200,7 +200,7 @@ def _build_orientation(pitch_deg: float, roll_deg: float, yaw_deg: float) -> lis
 
 
 def _render_dashboard(
-    values: tuple[int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int],
+    values: tuple[int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int],
     probe_result: str,
 ) -> str:
     (
@@ -216,6 +216,8 @@ def _render_dashboard(
         az,
         rc_link,
         rc_frames,
+        pressure_pa,
+        altitude_cm,
         ch1,
         ch2,
         ch3,
@@ -279,6 +281,7 @@ def _render_dashboard(
     lines.append("")
     lines.extend(orient)
     lines.append("")
+    lines.append(f"BARO: {pressure_pa:7d} Pa   ALT: {altitude_cm / 100.0:+7.2f} m")
     lines.extend(rest_lines)
     lines.append("")
     lines.append("Scale: 999..2000 maps to -1.0..+1.0")
