@@ -2,7 +2,7 @@
 """Graphical telemetry viewer for KAKUTEH7 serial stream.
 
 Usage:
-  python scripts/read_serial_gui.py --port COM9
+    python scripts/read_serial_gui.py --port COM6
 
 Requires:
   pip install pyserial
@@ -48,8 +48,10 @@ except Exception as exc:  # pragma: no cover
 SOF1 = 0xA5
 SOF2 = 0x5A
 PACKET_TYPE_TELEMETRY = 0x01
-TELEMETRY_PAYLOAD_LEN = 73
-TELEMETRY_STRUCT = struct.Struct("<Iiii6hBIIi16H")
+TELEMETRY_PAYLOAD_LEN_V1 = 73
+TELEMETRY_PAYLOAD_LEN_V2 = 83
+TELEMETRY_STRUCT_V1 = struct.Struct("<Iiii6hBIIi16H")
+TELEMETRY_STRUCT_V2 = struct.Struct("<Iiii6hBIIi16HBB4H")
 IMU_ACCEL_LSB_PER_G = 2048.0
 IMU_GYRO_DPS_PER_LSB = 2000.0 / 32768.0
 
@@ -111,10 +113,14 @@ def _decode_frames(buffer: bytearray) -> Iterable[tuple[int, ...]]:
             continue
         if packet_type != PACKET_TYPE_TELEMETRY:
             continue
-        if payload_len != TELEMETRY_PAYLOAD_LEN:
+        if payload_len == TELEMETRY_PAYLOAD_LEN_V1:
+            unpacked = TELEMETRY_STRUCT_V1.unpack(payload)
+            yield unpacked + (0, 0, 1000, 1000, 1000, 1000)
             continue
 
-        yield TELEMETRY_STRUCT.unpack(payload)
+        if payload_len == TELEMETRY_PAYLOAD_LEN_V2:
+            yield TELEMETRY_STRUCT_V2.unpack(payload)
+            continue
 
 
 @dataclass
@@ -134,6 +140,9 @@ class TelemetryState:
     rc_link_ok: bool = False
     rc_frames: int = 0
     channels: list[int] = field(default_factory=lambda: [0] * 16)
+    motor_mode: int = 0
+    motors_armed: int = 0
+    motors_us: list[int] = field(default_factory=lambda: [1000, 1000, 1000, 1000])
     last_update_monotonic: float = 0.0
     connected: bool = False
     port_name: str = ""
@@ -218,6 +227,11 @@ class SerialReader(threading.Thread):
                                     *channels,
                                 ) = values
 
+                                motor_mode = int(channels[16])
+                                motors_armed = int(channels[17])
+                                motors_us = [int(v) for v in channels[18:22]]
+                                channels = channels[:16]
+
                                 with self.lock:
                                     self.state.sequence = int(sequence)
                                     self.state.pitch_deg = int(pitch_cd) / 100.0
@@ -234,6 +248,9 @@ class SerialReader(threading.Thread):
                                     self.state.rc_link_ok = bool(rc_link)
                                     self.state.rc_frames = int(rc_frames)
                                     self.state.channels = [int(v) for v in channels]
+                                    self.state.motor_mode = motor_mode
+                                    self.state.motors_armed = motors_armed
+                                    self.state.motors_us = motors_us
                                     self.state.last_update_monotonic = time.monotonic()
                                     self.state.connected = True
                                     self.state.status_text = f"Connected: {candidate}"
@@ -306,7 +323,13 @@ class TelemetryApp:
         ttk.Label(channel_card, text="Channels", font=("Segoe UI", 12, "bold")).pack(anchor=tk.W, pady=(0, 6))
 
         self.channel_canvas = tk.Canvas(channel_card, bg="#0f1319", highlightthickness=0)
-        self.channel_canvas.pack(fill=tk.BOTH, expand=True)
+        self.channel_canvas.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        motor_card = ttk.Frame(right)
+        motor_card.pack(fill=tk.BOTH, expand=False)
+        ttk.Label(motor_card, text="Motors (M1-M4)", font=("Segoe UI", 12, "bold")).pack(anchor=tk.W, pady=(0, 6))
+        self.motor_canvas = tk.Canvas(motor_card, width=520, height=220, bg="#10161d", highlightthickness=0)
+        self.motor_canvas.pack(fill=tk.X, expand=False)
 
         self.footer_var = tk.StringVar(value="")
         ttk.Label(root, textvariable=self.footer_var, font=("Consolas", 10), padding=(10, 0, 10, 8)).pack(anchor=tk.W)
@@ -529,6 +552,44 @@ class TelemetryApp:
                 c.create_rectangle(val_x, y + 1, zero_x, y + 13, fill="#2563eb", outline="")
 
             c.create_text(right + 6, y + 8, anchor="w", fill="#cbd5e1", font=("Consolas", 10), text=f"{raw:4d}")
+
+    def _draw_motors(self, mode: int, armed: int, motors_us: list[int]) -> None:
+        c = self.motor_canvas
+        c.delete("all")
+        w = c.winfo_width()
+        h = c.winfo_height()
+
+        cx = w / 2.0
+        cy = h / 2.0 + 12.0
+        dx = 120.0
+        dy = 65.0
+        r = 30.0
+
+        mode_text = "REAL THROTTLE" if mode == 1 else "SIMULATION"
+        mode_color = "#ef4444" if mode == 1 else "#f59e0b"
+        arm_text = "ARMED" if armed else "DISARMED"
+        arm_color = "#22c55e" if armed else "#94a3b8"
+
+        c.create_text(10, 10, anchor="nw", fill="#e5e7eb", font=("Consolas", 11, "bold"), text=f"MODE: {mode_text}")
+        c.create_text(220, 10, anchor="nw", fill=arm_color, font=("Consolas", 11, "bold"), text=f"STATE: {arm_text}")
+        c.create_line(cx - 70, cy - 38, cx + 70, cy + 38, fill="#334155", width=2)
+        c.create_line(cx + 70, cy - 38, cx - 70, cy + 38, fill="#334155", width=2)
+
+        positions = [
+            (cx + dx, cy - dy),
+            (cx - dx, cy - dy),
+            (cx - dx, cy + dy),
+            (cx + dx, cy + dy),
+        ]
+
+        for idx, (mx, my) in enumerate(positions):
+            us = int(motors_us[idx]) if idx < len(motors_us) else 1000
+            norm = max(0.0, min(1.0, (us - 1000) / 1000.0))
+            fill = "#1f2937" if us <= 1000 else mode_color
+            c.create_oval(mx - r, my - r, mx + r, my + r, fill=fill, outline="#64748b", width=2)
+            c.create_arc(mx - r, my - r, mx + r, my + r, start=90, extent=-360.0 * norm, style=tk.ARC, outline="#22c55e", width=4)
+            c.create_text(mx, my - 3, fill="#e2e8f0", font=("Consolas", 10, "bold"), text=f"M{idx + 1}")
+            c.create_text(mx, my + 12, fill="#cbd5e1", font=("Consolas", 9), text=f"{us:4d} us")
 
     def _draw_board_3d(self, pitch: float, roll: float, yaw: float, quaternion=None) -> None:
         c = self.board3d_canvas
@@ -809,6 +870,9 @@ class TelemetryApp:
                 rc_link_ok=self.state.rc_link_ok,
                 rc_frames=self.state.rc_frames,
                 channels=list(self.state.channels),
+                motor_mode=self.state.motor_mode,
+                motors_armed=self.state.motors_armed,
+                motors_us=list(self.state.motors_us),
                 last_update_monotonic=self.state.last_update_monotonic,
                 connected=self.state.connected,
                 port_name=self.state.port_name,
@@ -819,9 +883,11 @@ class TelemetryApp:
         link = "OK" if snapshot.rc_link_ok else "--"
         ser = "UP" if snapshot.connected else "DN"
         port = snapshot.port_name if snapshot.port_name else "n/a"
+        motor_mode_text = "REAL" if snapshot.motor_mode == 1 else "SIM"
+        motor_state_text = "ARM" if snapshot.motors_armed else "DIS"
         self.header_var.set(
             f"SEQ {snapshot.sequence:06d}   RC {link}   RF {snapshot.rc_frames:6d}   "
-            f"SER {ser} ({port})   Age {age_ms:6.1f} ms"
+            f"MOT {motor_mode_text}/{motor_state_text}   SER {ser} ({port})   Age {age_ms:6.1f} ms"
         )
         self.imu_var.set(
             f"GX {snapshot.gx:6d}  GY {snapshot.gy:6d}  GZ {snapshot.gz:6d}    "
@@ -833,7 +899,11 @@ class TelemetryApp:
         fusion_label = "FusionGUI:ON" if self._fusion_ready else "FusionGUI:OFF"
         if (not self._fusion_ready) and imufusion_error:
             fusion_label = f"{fusion_label} ({imufusion_error})"
-        self.footer_var.set(f"{snapshot.status_text} | {fusion_label} | Scale: channels map 999..2000 to -1..+1")
+        self.footer_var.set(
+            f"{snapshot.status_text} | {fusion_label} | Motor us: "
+            f"M1 {snapshot.motors_us[0]:4d} M2 {snapshot.motors_us[1]:4d} "
+            f"M3 {snapshot.motors_us[2]:4d} M4 {snapshot.motors_us[3]:4d}"
+        )
 
         fusion_quaternion = self._compute_fusion_quaternion(snapshot)
         if fusion_quaternion is not None:
@@ -845,13 +915,14 @@ class TelemetryApp:
         self._draw_sticks(snapshot.channels)
         self._draw_board_3d(source_pitch, source_roll, source_yaw, fusion_quaternion)
         self._draw_channels(snapshot.channels)
+        self._draw_motors(snapshot.motor_mode, snapshot.motors_armed, snapshot.motors_us)
 
         self.root.after(33, self.update)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Graphical telemetry viewer for serial telemetry")
-    parser.add_argument("--port", default="COM6", help="Serial port, for example COM9 or auto")
+    parser.add_argument("--port", default="COM6", help="Serial port, for example COM6 or auto")
     parser.add_argument("--baud", type=int, default=115200, help="Baud rate")
     args = parser.parse_args()
 

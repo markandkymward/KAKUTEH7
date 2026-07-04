@@ -309,13 +309,13 @@
             "problemMatcher": []
         },
         {
-            "label": "Serial Monitor COM9 (115200)",
+            "label": "Serial Monitor COM6 (115200)",
             "type": "process",
             "command": "powershell",
             "args": [
                 "-NoProfile",
                 "-Command",
-                "$portName='COM9'; $baud=115200; while ($true) { $port=$null; try { $port = New-Object System.IO.Ports.SerialPort $portName,$baud,'None',8,'One'; $port.NewLine = \"`r`n\"; $port.ReadTimeout = 500; $port.Open(); Write-Output \"Monitoring $portName at $baud 8N1 (Ctrl+C to stop).\"; while ($true) { try { $line = $port.ReadLine(); if ($line) { Write-Output $line } } catch [System.TimeoutException] { } } } catch { Write-Output (\"$portName not ready: \" + $_.Exception.Message); Start-Sleep -Milliseconds 800 } finally { if ($port -and $port.IsOpen) { $port.Close() } } }"
+                "$portName='COM6'; $baud=115200; while ($true) { $port=$null; try { $port = New-Object System.IO.Ports.SerialPort $portName,$baud,'None',8,'One'; $port.NewLine = \"`r`n\"; $port.ReadTimeout = 500; $port.Open(); Write-Output \"Monitoring $portName at $baud 8N1 (Ctrl+C to stop).\"; while ($true) { try { $line = $port.ReadLine(); if ($line) { Write-Output $line } } catch [System.TimeoutException] { } } } catch { Write-Output (\"$portName not ready: \" + $_.Exception.Message); Start-Sleep -Milliseconds 800 } finally { if ($port -and $port.IsOpen) { $port.Close() } } }"
             ],
             "options": {
                 "cwd": "${workspaceFolder}"

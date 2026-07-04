@@ -63,6 +63,8 @@
 #define IMU_ALIGN_CW90          1U
 #define IMU_ALIGN_CW180         2U
 #define IMU_ALIGN_CW270         3U
+/* Temporary diagnostic mode: keep only USB bring-up to isolate enumeration issues. */
+#define USB_ENUM_DIAGNOSTIC     0U
 /* Board-to-sensor alignment mapping (matches verified physical orientation). */
 #define IMU_SENSOR_ALIGNMENT     IMU_ALIGN_CW270
 
@@ -78,6 +80,41 @@
 #define CRSF_FRAME_GAP_RESET_MS         3U
 #define CRSF_RX_FIFO_SIZE               256U
 
+#define MOTOR_COUNT                     4U
+#define MOTOR_PWM_MIN_US                1000U
+#define MOTOR_PWM_MAX_US                2000U
+#define MOTOR_ARM_SWITCH_US             1600U
+#define MOTOR_THROTTLE_MIN_US           1000U
+#define MOTOR_THROTTLE_MAX_US           2000U
+#define MOTOR_MODE_SWITCH_US            1600U
+#define MOTOR_MODE_SWITCH_CHANNEL_FIRST 5U   /* CH6 */
+#define MOTOR_MODE_SWITCH_CHANNEL_LAST  11U  /* CH12 */
+#define MOTOR_OUTPUT_MODE_SIMULATION    0U
+#define MOTOR_OUTPUT_MODE_REAL_THROTTLE 1U
+#define MOTOR_FIXED_TEST_ENABLE         0U
+#define MOTOR_FIXED_TEST_ENABLE_CHANNEL 7U   /* CH8 */
+#define MOTOR_FIXED_TEST_SELECT_CHANNEL 8U   /* CH9 */
+#define MOTOR_FIXED_TEST_ENABLE_US      1600U
+#define MOTOR_FIXED_TEST_US             1300U
+#define MOTOR_FORCE_ALL_TEST_ENABLE     0U
+#define MOTOR_FORCE_ALL_TEST_US         1600U
+#define MOTOR_PWM_SELF_TEST_ENABLE      0U
+#define MOTOR_PWM_SELF_TEST_US          1600U
+#define MOTOR_INIT_AT_BOOT              1U
+#define MOTOR_HW_OUTPUT_ENABLE          1U
+#define MOTOR_PROTOCOL_DSHOT300_TEST    0U
+#define MOTOR_PWM_RATE_HZ               50U
+#define MOTOR_TIMER_TICK_HZ             1000000U
+#define MOTOR_SPIN_FLOOR_US             1070U
+/* Diagnostic: also drive legacy PA0-PA3 TIM2 outputs while using INAV S1-S4 map. */
+#define MOTOR_OUTPUT_DUAL_MAP_DIAG      0U
+
+#define MOTOR1_GPIO_PIN                 GPIO_PIN_0   /* S1: TIM3_CH3 */
+#define MOTOR2_GPIO_PIN                 GPIO_PIN_1   /* S2: TIM3_CH4 */
+#define MOTOR3_GPIO_PIN                 GPIO_PIN_3   /* S3: TIM2_CH2 */
+#define MOTOR4_GPIO_PIN                 GPIO_PIN_10  /* S4: TIM2_CH3 */
+#define MOTOR_DSHOT_GPIO_MASK           (MOTOR1_GPIO_PIN | MOTOR2_GPIO_PIN | MOTOR3_GPIO_PIN | MOTOR4_GPIO_PIN)
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -91,6 +128,8 @@ UART_HandleTypeDef huart4;
 UART_HandleTypeDef huart5;
 UART_HandleTypeDef huart1;
 I2C_HandleTypeDef hi2c1;
+TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim3;
 
 /* USER CODE BEGIN PV */
 
@@ -170,6 +209,19 @@ static volatile uint8_t g_crsf_rx_fifo[CRSF_RX_FIFO_SIZE] = {0U};
 static volatile uint8_t g_crsf_rx_gap_fifo[CRSF_RX_FIFO_SIZE] = {0U};
 static volatile uint16_t g_crsf_rx_head = 0U;
 static volatile uint16_t g_crsf_rx_tail = 0U;
+static uint8_t g_motors_armed = 0U;
+static uint8_t g_motor_output_mode = MOTOR_OUTPUT_MODE_SIMULATION;
+static uint8_t g_motor_hw_ready = 0U;
+static uint8_t g_motor_dshot_ready = 0U;
+static uint32_t g_motor_dshot_bit_cycles = 0U;
+static uint32_t g_motor_dshot_t0h_cycles = 0U;
+static uint32_t g_motor_dshot_t1h_cycles = 0U;
+static uint16_t g_motor_cmd_us[MOTOR_COUNT] = {
+  MOTOR_PWM_MIN_US,
+  MOTOR_PWM_MIN_US,
+  MOTOR_PWM_MIN_US,
+  MOTOR_PWM_MIN_US
+};
 
 static void RC_SetFailsafeNeutral(void)
 {
@@ -188,7 +240,7 @@ static volatile uint32_t g_crsf_last_isr_byte_ms = 0U;
 #define TELEMETRY_PACKET_SOF1           0xA5U
 #define TELEMETRY_PACKET_SOF2           0x5AU
 #define TELEMETRY_PACKET_TYPE_TELEMETRY  0x01U
-#define TELEMETRY_PACKET_PAYLOAD_BYTES   73U
+#define TELEMETRY_PACKET_PAYLOAD_BYTES   83U
 
 #define BMP280_I2C_TIMEOUT_MS           20U
 #define BMP280_REG_ID                   0xD0U
@@ -249,11 +301,540 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart);
 static void IMU_ApplyAlignment(float x, float y, float z, float *xo, float *yo, float *zo);
 static void IMU_SetQuaternionFromEuler(float roll_deg, float pitch_deg, float yaw_deg);
+static void MotorControl_UpdateVirtual(void);
+static void MotorControl_Disarm(void);
+static uint8_t MX_TIM2_Init_MotorPwm(void);
+static void MotorOutput_InitAndStart(void);
+static void MotorOutput_WriteMicroseconds(const uint16_t *motor_us);
+static float MotorControl_ClampF(float value, float min_value, float max_value);
+static float MotorControl_ChannelToBiPolar(uint16_t us);
+static float MotorControl_ChannelToThrottle(uint16_t us);
+static uint8_t MotorDshot_Init(void);
+static void MotorDshot_SendFromUs(const uint16_t *motor_us);
+static uint16_t MotorDshot_EncodeThrottle(uint16_t throttle_value);
+static uint16_t MotorDshot_UsToValue(uint16_t us);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+static float MotorControl_ClampF(float value, float min_value, float max_value)
+{
+  if (value < min_value)
+  {
+    return min_value;
+  }
+  if (value > max_value)
+  {
+    return max_value;
+  }
+  return value;
+}
+
+static float MotorControl_ChannelToBiPolar(uint16_t us)
+{
+  float centered = ((float)us - 1500.0f) / 500.0f;
+  return MotorControl_ClampF(centered, -1.0f, 1.0f);
+}
+
+static float MotorControl_ChannelToThrottle(uint16_t us)
+{
+  float normalized = ((float)us - (float)MOTOR_THROTTLE_MIN_US)
+                   / (float)(MOTOR_THROTTLE_MAX_US - MOTOR_THROTTLE_MIN_US);
+  return MotorControl_ClampF(normalized, 0.0f, 1.0f);
+}
+
+static uint16_t MotorDshot_UsToValue(uint16_t us)
+{
+  uint16_t clamped_us = us;
+
+  if (clamped_us <= MOTOR_PWM_MIN_US)
+  {
+    return 0U;
+  }
+  if (clamped_us > MOTOR_PWM_MAX_US)
+  {
+    clamped_us = MOTOR_PWM_MAX_US;
+  }
+
+  /* Map 1001..2000us to DShot throttle range 48..2047. */
+  return (uint16_t)(48U + (((uint32_t)(clamped_us - (MOTOR_PWM_MIN_US + 1U)) * 1999U) / 999U));
+}
+
+static uint16_t MotorDshot_EncodeThrottle(uint16_t throttle_value)
+{
+  uint16_t packet = (uint16_t)((throttle_value & 0x07FFU) << 1U);
+  uint16_t csum_data = packet;
+  uint8_t csum = 0U;
+
+  /* 4-bit checksum over 3 nibbles. */
+  for (uint8_t i = 0U; i < 3U; i++)
+  {
+    csum ^= (uint8_t)(csum_data & 0x000FU);
+    csum_data >>= 4U;
+  }
+
+  return (uint16_t)((packet << 4U) | (csum & 0x0FU));
+}
+
+static uint8_t MotorDshot_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  const uint32_t hclk_hz = HAL_RCC_GetHCLKFreq();
+
+  if (hclk_hz == 0U)
+  {
+    return 0U;
+  }
+
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  GPIO_InitStruct.Pin = MOTOR_DSHOT_GPIO_MASK;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  HAL_GPIO_WritePin(GPIOB, MOTOR_DSHOT_GPIO_MASK, GPIO_PIN_RESET);
+
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0U;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+  g_motor_dshot_bit_cycles = (hclk_hz + 150000U) / 300000U;
+  if (g_motor_dshot_bit_cycles < 16U)
+  {
+    return 0U;
+  }
+
+  g_motor_dshot_t0h_cycles = (g_motor_dshot_bit_cycles * 3U) / 8U;
+  g_motor_dshot_t1h_cycles = (g_motor_dshot_bit_cycles * 3U) / 4U;
+  if (g_motor_dshot_t0h_cycles < 1U)
+  {
+    g_motor_dshot_t0h_cycles = 1U;
+  }
+  if (g_motor_dshot_t1h_cycles <= g_motor_dshot_t0h_cycles)
+  {
+    g_motor_dshot_t1h_cycles = g_motor_dshot_t0h_cycles + 1U;
+  }
+
+  return 1U;
+}
+
+static void MotorDshot_SendFromUs(const uint16_t *motor_us)
+{
+  uint16_t frame[MOTOR_COUNT] = {0U, 0U, 0U, 0U};
+  const uint16_t pin_mask[MOTOR_COUNT] = {MOTOR1_GPIO_PIN, MOTOR2_GPIO_PIN, MOTOR3_GPIO_PIN, MOTOR4_GPIO_PIN};
+
+  if ((motor_us == NULL) || (g_motor_dshot_ready == 0U))
+  {
+    return;
+  }
+
+  for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
+  {
+    const uint16_t value = MotorDshot_UsToValue(motor_us[i]);
+    frame[i] = MotorDshot_EncodeThrottle(value);
+  }
+
+  for (uint8_t bit = 0U; bit < 16U; bit++)
+  {
+    uint16_t ones_mask = 0U;
+    uint16_t zero_mask = 0U;
+    const uint16_t bit_mask = (uint16_t)(1U << (15U - bit));
+    const uint32_t t_start = DWT->CYCCNT;
+
+    for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
+    {
+      if ((frame[i] & bit_mask) != 0U)
+      {
+        ones_mask |= pin_mask[i];
+      }
+      else
+      {
+        zero_mask |= pin_mask[i];
+      }
+    }
+
+    GPIOB->BSRR = (uint32_t)MOTOR_DSHOT_GPIO_MASK;
+    while ((uint32_t)(DWT->CYCCNT - t_start) < g_motor_dshot_t0h_cycles) {}
+    GPIOB->BSRR = (uint32_t)zero_mask << 16U;
+    while ((uint32_t)(DWT->CYCCNT - t_start) < g_motor_dshot_t1h_cycles) {}
+    GPIOB->BSRR = (uint32_t)ones_mask << 16U;
+    while ((uint32_t)(DWT->CYCCNT - t_start) < g_motor_dshot_bit_cycles) {}
+  }
+
+  GPIOB->BSRR = (uint32_t)MOTOR_DSHOT_GPIO_MASK << 16U;
+  {
+    const uint32_t t_gap_start = DWT->CYCCNT;
+    const uint32_t gap_cycles = g_motor_dshot_bit_cycles * 2U;
+    while ((uint32_t)(DWT->CYCCNT - t_gap_start) < gap_cycles) {}
+  }
+}
+
+static void MotorControl_Disarm(void)
+{
+  g_motors_armed = 0U;
+  for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
+  {
+    g_motor_cmd_us[i] = MOTOR_PWM_MIN_US;
+  }
+
+  MotorOutput_WriteMicroseconds(g_motor_cmd_us);
+}
+
+static uint8_t MX_TIM2_Init_MotorPwm(void)
+{
+#if (MOTOR_HW_OUTPUT_ENABLE != 0U)
+#if (MOTOR_PROTOCOL_DSHOT300_TEST != 0U)
+  g_motor_dshot_ready = MotorDshot_Init();
+  return g_motor_dshot_ready;
+#else
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  uint32_t tim_clk_hz = HAL_RCC_GetPCLK1Freq();
+
+  if (tim_clk_hz < MOTOR_TIMER_TICK_HZ)
+  {
+    return 0U;
+  }
+
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_TIM2_CLK_ENABLE();
+  __HAL_RCC_TIM3_CLK_ENABLE();
+
+  GPIO_InitStruct.Pin = MOTOR1_GPIO_PIN | MOTOR2_GPIO_PIN;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  GPIO_InitStruct.Alternate = GPIO_AF2_TIM3;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = MOTOR3_GPIO_PIN | MOTOR4_GPIO_PIN;
+  GPIO_InitStruct.Alternate = GPIO_AF1_TIM2;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+#if (MOTOR_OUTPUT_DUAL_MAP_DIAG != 0U)
+  GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3;
+  GPIO_InitStruct.Alternate = GPIO_AF1_TIM2;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+#endif
+
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = (uint32_t)(tim_clk_hz / MOTOR_TIMER_TICK_HZ) - 1U;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = (MOTOR_TIMER_TICK_HZ / MOTOR_PWM_RATE_HZ) - 1U;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+
+  if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
+  {
+    return 0U;
+  }
+
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = MOTOR_PWM_MIN_US;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    return 0U;
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    return 0U;
+  }
+#if (MOTOR_OUTPUT_DUAL_MAP_DIAG != 0U)
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    return 0U;
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    return 0U;
+  }
+#endif
+
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = (uint32_t)(tim_clk_hz / MOTOR_TIMER_TICK_HZ) - 1U;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = (MOTOR_TIMER_TICK_HZ / MOTOR_PWM_RATE_HZ) - 1U;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+
+  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+  {
+    return 0U;
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    return 0U;
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    return 0U;
+  }
+
+  if (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2) != HAL_OK)
+  {
+    return 0U;
+  }
+  if (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3) != HAL_OK)
+  {
+    return 0U;
+  }
+#if (MOTOR_OUTPUT_DUAL_MAP_DIAG != 0U)
+  if (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1) != HAL_OK)
+  {
+    return 0U;
+  }
+  if (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_4) != HAL_OK)
+  {
+    return 0U;
+  }
+#endif
+  if (HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3) != HAL_OK)
+  {
+    return 0U;
+  }
+  if (HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4) != HAL_OK)
+  {
+    return 0U;
+  }
+
+  return 1U;
+#endif
+#else
+  return 0U;
+#endif
+}
+
+static void MotorOutput_InitAndStart(void)
+{
+  g_motor_hw_ready = MX_TIM2_Init_MotorPwm();
+  MotorOutput_WriteMicroseconds(g_motor_cmd_us);
+}
+
+static void MotorOutput_WriteMicroseconds(const uint16_t *motor_us)
+{
+#if (MOTOR_HW_OUTPUT_ENABLE != 0U)
+#if (MOTOR_PROTOCOL_DSHOT300_TEST != 0U)
+  if ((g_motor_hw_ready == 0U) || (motor_us == NULL))
+  {
+    return;
+  }
+
+  MotorDshot_SendFromUs(motor_us);
+#else
+  uint16_t m1 = MOTOR_PWM_MIN_US;
+  uint16_t m2 = MOTOR_PWM_MIN_US;
+  uint16_t m3 = MOTOR_PWM_MIN_US;
+  uint16_t m4 = MOTOR_PWM_MIN_US;
+
+  if ((g_motor_hw_ready == 0U) || (motor_us == NULL))
+  {
+    return;
+  }
+
+  m1 = (uint16_t)MotorControl_ClampF((float)motor_us[0], (float)MOTOR_PWM_MIN_US, (float)MOTOR_PWM_MAX_US);
+  m2 = (uint16_t)MotorControl_ClampF((float)motor_us[1], (float)MOTOR_PWM_MIN_US, (float)MOTOR_PWM_MAX_US);
+  m3 = (uint16_t)MotorControl_ClampF((float)motor_us[2], (float)MOTOR_PWM_MIN_US, (float)MOTOR_PWM_MAX_US);
+  m4 = (uint16_t)MotorControl_ClampF((float)motor_us[3], (float)MOTOR_PWM_MIN_US, (float)MOTOR_PWM_MAX_US);
+
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, m1);
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, m2);
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, m3);
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, m4);
+#if (MOTOR_OUTPUT_DUAL_MAP_DIAG != 0U)
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, m1);
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, m4);
+#endif
+#endif
+#else
+  UNUSED(motor_us);
+#endif
+}
+
+/* Step 1 motor-controller scaffold: software mixer only, no PWM output yet. */
+static void MotorControl_UpdateVirtual(void)
+{
+  const uint8_t arm_switch_on = (g_rc_channels_us[4] >= MOTOR_ARM_SWITCH_US) ? 1U : 0U;
+  const uint8_t fixed_test_on = (g_rc_channels_us[MOTOR_FIXED_TEST_ENABLE_CHANNEL] >= MOTOR_FIXED_TEST_ENABLE_US) ? 1U : 0U;
+  uint8_t real_mode_on = 0U;
+  const float throttle = MotorControl_ChannelToThrottle(g_rc_channels_us[2]);
+  const float roll = MotorControl_ChannelToBiPolar(g_rc_channels_us[0]);
+  const float pitch = MotorControl_ChannelToBiPolar(g_rc_channels_us[1]);
+  const float yaw = MotorControl_ChannelToBiPolar(g_rc_channels_us[3]);
+
+  for (uint8_t mode_ch = MOTOR_MODE_SWITCH_CHANNEL_FIRST; mode_ch <= MOTOR_MODE_SWITCH_CHANNEL_LAST; mode_ch++)
+  {
+    if (g_rc_channels_us[mode_ch] >= MOTOR_MODE_SWITCH_US)
+    {
+      real_mode_on = 1U;
+      break;
+    }
+  }
+
+  const float roll_mix = roll * 0.25f;
+  const float pitch_mix = pitch * 0.25f;
+  const float yaw_mix = yaw * 0.20f;
+
+  float motor_norm[MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+#if (MOTOR_PWM_SELF_TEST_ENABLE != 0U)
+  g_motor_output_mode = MOTOR_OUTPUT_MODE_REAL_THROTTLE;
+  g_motors_armed = 1U;
+
+  if (g_motor_hw_ready == 0U)
+  {
+    MotorOutput_InitAndStart();
+    if (g_motor_hw_ready == 0U)
+    {
+      MotorControl_Disarm();
+      return;
+    }
+  }
+
+  for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
+  {
+    g_motor_cmd_us[i] = MOTOR_PWM_SELF_TEST_US;
+  }
+  MotorOutput_WriteMicroseconds(g_motor_cmd_us);
+  return;
+#endif
+
+  if ((g_rc_link_ok == 0U) || (arm_switch_on == 0U))
+  {
+    g_motor_output_mode = MOTOR_OUTPUT_MODE_SIMULATION;
+    MotorControl_Disarm();
+    return;
+  }
+
+  if (g_motors_armed == 0U)
+  {
+    g_motors_armed = 1U;
+  }
+
+  if (g_motors_armed == 0U)
+  {
+    g_motor_output_mode = MOTOR_OUTPUT_MODE_SIMULATION;
+    MotorControl_Disarm();
+    return;
+  }
+
+#if (MOTOR_FORCE_ALL_TEST_ENABLE != 0U)
+  g_motor_output_mode = MOTOR_OUTPUT_MODE_REAL_THROTTLE;
+  if (g_motor_hw_ready == 0U)
+  {
+    MotorOutput_InitAndStart();
+    if (g_motor_hw_ready == 0U)
+    {
+      g_motor_output_mode = MOTOR_OUTPUT_MODE_SIMULATION;
+      MotorControl_Disarm();
+      return;
+    }
+  }
+
+  for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
+  {
+    g_motor_cmd_us[i] = MOTOR_FORCE_ALL_TEST_US;
+  }
+  MotorOutput_WriteMicroseconds(g_motor_cmd_us);
+  return;
+#endif
+
+  g_motor_output_mode = (real_mode_on != 0U) ? MOTOR_OUTPUT_MODE_REAL_THROTTLE : MOTOR_OUTPUT_MODE_SIMULATION;
+
+  if (g_motor_output_mode == MOTOR_OUTPUT_MODE_REAL_THROTTLE)
+  {
+    if (g_motor_hw_ready == 0U)
+    {
+      MotorOutput_InitAndStart();
+      if (g_motor_hw_ready == 0U)
+      {
+        g_motor_output_mode = MOTOR_OUTPUT_MODE_SIMULATION;
+        MotorControl_Disarm();
+        return;
+      }
+    }
+
+#if (MOTOR_FIXED_TEST_ENABLE != 0U)
+    if (fixed_test_on != 0U)
+    {
+      const uint16_t select_us = g_rc_channels_us[MOTOR_FIXED_TEST_SELECT_CHANNEL];
+      uint8_t selected_motor = 0U;
+
+      if (select_us < 1250U)
+      {
+        selected_motor = 0U;
+      }
+      else if (select_us < 1500U)
+      {
+        selected_motor = 1U;
+      }
+      else if (select_us < 1750U)
+      {
+        selected_motor = 2U;
+      }
+      else
+      {
+        selected_motor = 3U;
+      }
+
+      for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
+      {
+        g_motor_cmd_us[i] = MOTOR_PWM_MIN_US;
+      }
+      g_motor_cmd_us[selected_motor] = MOTOR_FIXED_TEST_US;
+
+      MotorOutput_WriteMicroseconds(g_motor_cmd_us);
+      return;
+    }
+#else
+    UNUSED(fixed_test_on);
+#endif
+
+    uint16_t throttle_us = (uint16_t)(MOTOR_PWM_MIN_US + (uint16_t)lroundf(throttle * 1000.0f));
+    if (throttle_us > MOTOR_PWM_MIN_US)
+    {
+      if (throttle_us < MOTOR_SPIN_FLOOR_US)
+      {
+        throttle_us = MOTOR_SPIN_FLOOR_US;
+      }
+    }
+    for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
+    {
+      g_motor_cmd_us[i] = throttle_us;
+    }
+
+    MotorOutput_WriteMicroseconds(g_motor_cmd_us);
+    return;
+  }
+
+  /* Quad-X software mix (FR, FL, RL, RR) in simulation mode. */
+  motor_norm[0] = throttle + pitch_mix + roll_mix - yaw_mix;
+  motor_norm[1] = throttle + pitch_mix - roll_mix + yaw_mix;
+  motor_norm[2] = throttle - pitch_mix - roll_mix - yaw_mix;
+  motor_norm[3] = throttle - pitch_mix + roll_mix + yaw_mix;
+
+  for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
+  {
+    const float clamped = MotorControl_ClampF(motor_norm[i], 0.0f, 1.0f);
+    g_motor_cmd_us[i] = (uint16_t)(MOTOR_PWM_MIN_US + (uint16_t)lroundf(clamped * 1000.0f));
+  }
+
+  {
+    const uint16_t motor_hold_us[MOTOR_COUNT] = {
+      MOTOR_PWM_MIN_US,
+      MOTOR_PWM_MIN_US,
+      MOTOR_PWM_MIN_US,
+      MOTOR_PWM_MIN_US
+    };
+    MotorOutput_WriteMicroseconds(motor_hold_us);
+  }
+}
 
 static void IMU_ApplyAlignment(float x, float y, float z, float *xo, float *yo, float *zo)
 {
@@ -388,11 +969,16 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+#if (USB_ENUM_DIAGNOSTIC == 0U)
   MX_I2C1_Init();
   MX_UART5_Init();
   MX_USART1_UART_Init();
-  MX_USB_DEVICE_Init();
   MX_UART4_Init();
+#if (MOTOR_INIT_AT_BOOT != 0U)
+  MotorOutput_InitAndStart();
+#endif
+#endif
+  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
   uint32_t next_imu_probe_ms = 0U;
   uint32_t next_baro_probe_ms = 0U;
@@ -402,6 +988,7 @@ int main(void)
 
   g_usb_ready = 1U;
 
+#if (USB_ENUM_DIAGNOSTIC == 0U)
   (void)IMU_TryBringup();
   (void)BMP280_Init();
   next_imu_probe_ms = HAL_GetTick() + 500U;
@@ -409,12 +996,16 @@ int main(void)
   next_baro_update_ms = HAL_GetTick();
   next_telemetry_ms = HAL_GetTick();
 
+  HAL_Delay(1000);
+
+  /* Keep USB telemetry alive even if CRSF UART RX cannot start. */
   if (HAL_UART_Receive_IT(&huart4, &g_uart4_rx_byte, 1U) != HAL_OK)
   {
-    Error_Handler();
+    g_rc_link_ok = 0U;
   }
-
+#else
   HAL_Delay(1000);
+#endif
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -424,6 +1015,9 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+#if (USB_ENUM_DIAGNOSTIC != 0U)
+    HAL_Delay(10);
+#else
     int16_t gyro_x = 0;
     int16_t gyro_y = 0;
     int16_t gyro_z = 0;
@@ -442,7 +1036,10 @@ int main(void)
     {
       g_rc_link_ok = 0U;
       RC_SetFailsafeNeutral();
+      MotorControl_Disarm();
     }
+
+    MotorControl_UpdateVirtual();
 
     if ((g_imu_found == 0U) && (HAL_GetTick() >= next_imu_probe_ms))
     {
@@ -512,6 +1109,7 @@ int main(void)
                            g_baro_altitude_cm);
       next_telemetry_ms = now_ms + 10U;
     }
+#endif
   }
   /* USER CODE END 3 */
 }
@@ -729,6 +1327,7 @@ void SystemClock_Config(void)
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
   RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
+  RCC_CRSInitTypeDef RCC_CRSInitStruct = {0};
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
@@ -767,6 +1366,16 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+
+  /* Keep HSI48 tightly locked for USB FS signaling. */
+  __HAL_RCC_CRS_CLK_ENABLE();
+  RCC_CRSInitStruct.Prescaler = RCC_CRS_SYNC_DIV1;
+  RCC_CRSInitStruct.Source = RCC_CRS_SYNC_SOURCE_USB1;
+  RCC_CRSInitStruct.Polarity = RCC_CRS_SYNC_POLARITY_RISING;
+  RCC_CRSInitStruct.ReloadValue = __HAL_RCC_CRS_RELOADVALUE_CALCULATE(48000000U, 1000U);
+  RCC_CRSInitStruct.ErrorLimitValue = RCC_CRS_ERRORLIMIT_DEFAULT;
+  RCC_CRSInitStruct.HSI48CalibrationValue = RCC_CRS_HSI48CALIBRATION_DEFAULT;
+  HAL_RCCEx_CRSConfig(&RCC_CRSInitStruct);
 }
 
 /**
@@ -1108,6 +1717,16 @@ static void Telemetry_SendPacket(int32_t pitch_cd, int32_t roll_cd, int32_t yaw_
   for (uint8_t ch = 4U; ch < CRSF_RC_CHANNEL_COUNT; ch++)
   {
     Packet_PutU16LE(&frame[4U + payload_index], g_rc_channels_us[ch]);
+    payload_index = (uint8_t)(payload_index + 2U);
+  }
+
+  frame[4U + payload_index] = g_motor_output_mode;
+  payload_index = (uint8_t)(payload_index + 1U);
+  frame[4U + payload_index] = g_motors_armed;
+  payload_index = (uint8_t)(payload_index + 1U);
+  for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
+  {
+    Packet_PutU16LE(&frame[4U + payload_index], g_motor_cmd_us[i]);
     payload_index = (uint8_t)(payload_index + 2U);
   }
 

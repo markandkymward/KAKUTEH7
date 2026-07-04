@@ -2,7 +2,7 @@
 """Read line-based telemetry from the KAKUTEH7 serial stream.
 
 Usage:
-  python scripts/read_serial.py --port COM9
+    python scripts/read_serial.py --port COM6
 
 Requires:
   pip install pyserial
@@ -101,8 +101,10 @@ def _pick_port() -> str | None:
 SOF1 = 0xA5
 SOF2 = 0x5A
 PACKET_TYPE_TELEMETRY = 0x01
-TELEMETRY_PAYLOAD_LEN = 73
-TELEMETRY_STRUCT = struct.Struct("<Iiii6hBIIi16H")
+TELEMETRY_PAYLOAD_LEN_V1 = 73
+TELEMETRY_PAYLOAD_LEN_V2 = 83
+TELEMETRY_STRUCT_V1 = struct.Struct("<Iiii6hBIIi16H")
+TELEMETRY_STRUCT_V2 = struct.Struct("<Iiii6hBIIi16HBB4H")
 
 
 def _checksum(packet_type: int, payload: bytes) -> int:
@@ -115,6 +117,17 @@ def _checksum(packet_type: int, payload: bytes) -> int:
 def _channel_to_norm(raw: int) -> float:
     clamped = max(999, min(2000, raw))
     return ((clamped - 999) / 1001.0) * 2.0 - 1.0
+
+
+def _normalize_payload(values: tuple[int, ...], payload_len: int) -> tuple[int, ...]:
+    if payload_len == TELEMETRY_PAYLOAD_LEN_V2:
+        return values
+
+    if payload_len == TELEMETRY_PAYLOAD_LEN_V1:
+        # Legacy payload without motor status fields.
+        return values + (0, 0, 1000, 1000, 1000, 1000)
+
+    raise ValueError(f"unsupported payload length: {payload_len}")
 
 
 def _build_stick(label: str, x_norm: float, y_norm: float) -> list[str]:
@@ -200,7 +213,7 @@ def _build_orientation(pitch_deg: float, roll_deg: float, yaw_deg: float) -> lis
 
 
 def _render_dashboard(
-    values: tuple[int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int],
+    values: tuple[int, ...],
     probe_result: str,
 ) -> str:
     (
@@ -234,6 +247,12 @@ def _render_dashboard(
         ch14,
         ch15,
         ch16,
+        motor_mode,
+        motors_armed,
+        m1,
+        m2,
+        m3,
+        m4,
     ) = values
 
     left_x = _channel_to_norm(ch4)   # yaw
@@ -282,6 +301,10 @@ def _render_dashboard(
     lines.extend(orient)
     lines.append("")
     lines.append(f"BARO: {pressure_pa:7d} Pa   ALT: {altitude_cm / 100.0:+7.2f} m")
+    mode_text = "REAL-THROTTLE" if motor_mode == 1 else "SIMULATION"
+    arm_text = "ARMED" if motors_armed else "DISARMED"
+    lines.append(f"MOTOR MODE: {mode_text}   STATE: {arm_text}")
+    lines.append(f"M1:{m1:4d}  M2:{m2:4d}  M3:{m3:4d}  M4:{m4:4d}")
     lines.extend(rest_lines)
     lines.append("")
     lines.append("Scale: 999..2000 maps to -1.0..+1.0")
@@ -320,10 +343,14 @@ def _decode_frames(buffer: bytearray) -> Iterable[tuple[int, ...]]:
         if packet_type != PACKET_TYPE_TELEMETRY:
             continue
 
-        if payload_len != TELEMETRY_PAYLOAD_LEN:
+        if payload_len == TELEMETRY_PAYLOAD_LEN_V1:
+            unpacked = TELEMETRY_STRUCT_V1.unpack(payload)
+        elif payload_len == TELEMETRY_PAYLOAD_LEN_V2:
+            unpacked = TELEMETRY_STRUCT_V2.unpack(payload)
+        else:
             continue
 
-        yield TELEMETRY_STRUCT.unpack(payload)
+        yield _normalize_payload(unpacked, payload_len)
 
 
 def main() -> int:
@@ -343,7 +370,7 @@ def main() -> int:
             print("Available serial ports:", file=sys.stderr)
             for port in ports:
                 print(f"  {port}", file=sys.stderr)
-        print("\nExample: python scripts/read_serial.py --port COM9", file=sys.stderr)
+        print("\nExample: python scripts/read_serial.py --port COM6", file=sys.stderr)
         return 1
 
     try:
