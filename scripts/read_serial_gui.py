@@ -48,10 +48,13 @@ except Exception as exc:  # pragma: no cover
 SOF1 = 0xA5
 SOF2 = 0x5A
 PACKET_TYPE_TELEMETRY = 0x01
+PACKET_TYPE_MOTOR_TEST = 0x10
 TELEMETRY_PAYLOAD_LEN_V1 = 73
 TELEMETRY_PAYLOAD_LEN_V2 = 83
+TELEMETRY_PAYLOAD_LEN_V3 = 84
 TELEMETRY_STRUCT_V1 = struct.Struct("<Iiii6hBIIi16H")
 TELEMETRY_STRUCT_V2 = struct.Struct("<Iiii6hBIIi16HBB4H")
+TELEMETRY_STRUCT_V3 = struct.Struct("<Iiii6hBIIi16HBBB4H")
 IMU_ACCEL_LSB_PER_G = 2048.0
 IMU_GYRO_DPS_PER_LSB = 2000.0 / 32768.0
 
@@ -115,12 +118,39 @@ def _decode_frames(buffer: bytearray) -> Iterable[tuple[int, ...]]:
             continue
         if payload_len == TELEMETRY_PAYLOAD_LEN_V1:
             unpacked = TELEMETRY_STRUCT_V1.unpack(payload)
-            yield unpacked + (0, 0, 1000, 1000, 1000, 1000)
+            yield unpacked + (0, 0, 0, 1000, 1000, 1000, 1000)
             continue
 
         if payload_len == TELEMETRY_PAYLOAD_LEN_V2:
-            yield TELEMETRY_STRUCT_V2.unpack(payload)
+            unpacked = TELEMETRY_STRUCT_V2.unpack(payload)
+            # Insert gui_test_active=0 between motors_armed and motor us fields.
+            yield unpacked[:32] + (0,) + unpacked[32:]
             continue
+
+        if payload_len == TELEMETRY_PAYLOAD_LEN_V3:
+            yield TELEMETRY_STRUCT_V3.unpack(payload)
+            continue
+
+
+def _build_motor_test_packet(motor_index: int, motor_us: int) -> bytes:
+    payload = bytes(
+        (
+            max(1, min(4, int(motor_index))),
+            int(max(1000, min(2000, int(motor_us)))) & 0xFF,
+            (int(max(1000, min(2000, int(motor_us)))) >> 8) & 0xFF,
+        )
+    )
+    packet_type = PACKET_TYPE_MOTOR_TEST
+    frame = bytearray((SOF1, SOF2, packet_type, len(payload)))
+    frame.extend(payload)
+    frame.append(_checksum(packet_type, payload))
+    return bytes(frame)
+
+
+def _build_motor_test_ascii(motor_index: int, motor_us: int) -> bytes:
+    idx = max(1, min(4, int(motor_index)))
+    us = max(1000, min(2000, int(motor_us)))
+    return f"MTEST {idx} {us}\n".encode("ascii")
 
 
 @dataclass
@@ -142,6 +172,7 @@ class TelemetryState:
     channels: list[int] = field(default_factory=lambda: [0] * 16)
     motor_mode: int = 0
     motors_armed: int = 0
+    gui_test_active: int = 0
     motors_us: list[int] = field(default_factory=lambda: [1000, 1000, 1000, 1000])
     last_update_monotonic: float = 0.0
     connected: bool = False
@@ -158,9 +189,30 @@ class SerialReader(threading.Thread):
         self.lock = lock
         self.running = True
         self.error_message = ""
+        self._tx_lock = threading.Lock()
+        self._tx_queue: list[bytes] = []
 
     def stop(self) -> None:
         self.running = False
+
+    def queue_command(self, frame: bytes) -> None:
+        if not frame:
+            return
+        with self._tx_lock:
+            self._tx_queue.append(frame)
+
+    def _drain_tx(self, ser: serial.Serial) -> None:
+        pending: list[bytes]
+        with self._tx_lock:
+            pending = self._tx_queue
+            self._tx_queue = []
+
+        for frame in pending:
+            try:
+                ser.write(frame)
+            except Exception:
+                self.error_message = "Failed to send command frame"
+                return
 
     def _candidate_ports(self) -> list[str]:
         if self.port.lower() != "auto":
@@ -198,6 +250,7 @@ class SerialReader(threading.Thread):
                         buffer = bytearray()
                         last_packet_time = time.monotonic()
                         while self.running:
+                            self._drain_tx(ser)
                             chunk = ser.read(ser.in_waiting or 1)
                             if not chunk:
                                 # If stream goes idle for too long, force reopen so reconnect/sniff can recover.
@@ -229,7 +282,8 @@ class SerialReader(threading.Thread):
 
                                 motor_mode = int(channels[16])
                                 motors_armed = int(channels[17])
-                                motors_us = [int(v) for v in channels[18:22]]
+                                gui_test_active = int(channels[18])
+                                motors_us = [int(v) for v in channels[19:23]]
                                 channels = channels[:16]
 
                                 with self.lock:
@@ -250,6 +304,7 @@ class SerialReader(threading.Thread):
                                     self.state.channels = [int(v) for v in channels]
                                     self.state.motor_mode = motor_mode
                                     self.state.motors_armed = motors_armed
+                                    self.state.gui_test_active = gui_test_active
                                     self.state.motors_us = motors_us
                                     self.state.last_update_monotonic = time.monotonic()
                                     self.state.connected = True
@@ -276,10 +331,11 @@ class SerialReader(threading.Thread):
 
 
 class TelemetryApp:
-    def __init__(self, root: tk.Tk, state: TelemetryState, lock: threading.Lock):
+    def __init__(self, root: tk.Tk, state: TelemetryState, lock: threading.Lock, reader: SerialReader):
         self.root = root
         self.state = state
         self.lock = lock
+        self.reader = reader
 
         root.title("KAKUTEH7 Telemetry GUI")
         root.geometry("1180x760")
@@ -304,11 +360,58 @@ class TelemetryApp:
         right = ttk.Frame(body)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
-        self.att_canvas = tk.Canvas(left, width=560, height=340, bg="#0f1720", highlightthickness=0)
-        self.att_canvas.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-
         self.stick_canvas = tk.Canvas(left, width=560, height=280, bg="#151a22", highlightthickness=0)
-        self.stick_canvas.pack(fill=tk.BOTH, expand=True)
+        self.stick_canvas.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        left_motor_card = ttk.Frame(left)
+        left_motor_card.pack(fill=tk.BOTH, expand=True)
+
+        control_card = ttk.LabelFrame(left_motor_card, text="Single Motor Test (USB)")
+        control_card.pack(fill=tk.X, expand=False, pady=(0, 8))
+
+        self.test_motor_var = tk.IntVar(value=1)
+        self.test_us_var = tk.IntVar(value=1100)
+        self.test_running = False
+        self.test_after_id: str | None = None
+
+        row1 = ttk.Frame(control_card)
+        row1.pack(fill=tk.X, padx=8, pady=(8, 4))
+        ttk.Label(row1, text="Motor").pack(side=tk.LEFT)
+        ttk.Combobox(
+            row1,
+            width=6,
+            textvariable=self.test_motor_var,
+            values=(1, 2, 3, 4),
+            state="readonly",
+        ).pack(side=tk.LEFT, padx=(8, 14))
+
+        ttk.Label(row1, text="Power (us)").pack(side=tk.LEFT)
+        self.test_us_scale = ttk.Scale(
+            row1,
+            from_=1000,
+            to=2000,
+            orient=tk.HORIZONTAL,
+            command=self._on_test_us_changed,
+        )
+        self.test_us_scale.set(1100)
+        self.test_us_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8))
+        self.test_us_label = ttk.Label(row1, width=8, text="1100 us")
+        self.test_us_label.pack(side=tk.LEFT)
+
+        row2 = ttk.Frame(control_card)
+        row2.pack(fill=tk.X, padx=8, pady=(2, 8))
+        self.test_button = ttk.Button(row2, text="Hold To Run")
+        self.test_button.pack(side=tk.LEFT)
+        self.test_button.bind("<ButtonPress-1>", self._on_test_press)
+        self.test_button.bind("<ButtonRelease-1>", self._on_test_release)
+        self.test_button.bind("<Leave>", self._on_test_release)
+        ttk.Label(row2, text="Sends command every 80 ms with 250 ms firmware timeout.").pack(side=tk.LEFT, padx=(10, 0))
+
+        motor_card = ttk.Frame(left_motor_card)
+        motor_card.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(motor_card, text="Motors (M1-M4)", font=("Segoe UI", 12, "bold")).pack(anchor=tk.W, pady=(0, 6))
+        self.motor_canvas = tk.Canvas(motor_card, width=520, height=220, bg="#10161d", highlightthickness=0)
+        self.motor_canvas.pack(fill=tk.BOTH, expand=True)
 
         board3d_card = ttk.Frame(right)
         board3d_card.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
@@ -325,11 +428,11 @@ class TelemetryApp:
         self.channel_canvas = tk.Canvas(channel_card, bg="#0f1319", highlightthickness=0)
         self.channel_canvas.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
-        motor_card = ttk.Frame(right)
-        motor_card.pack(fill=tk.BOTH, expand=False)
-        ttk.Label(motor_card, text="Motors (M1-M4)", font=("Segoe UI", 12, "bold")).pack(anchor=tk.W, pady=(0, 6))
-        self.motor_canvas = tk.Canvas(motor_card, width=520, height=220, bg="#10161d", highlightthickness=0)
-        self.motor_canvas.pack(fill=tk.X, expand=False)
+        att_card = ttk.Frame(right)
+        att_card.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(att_card, text="Attitude Indicator", font=("Segoe UI", 12, "bold")).pack(anchor=tk.W, pady=(0, 6))
+        self.att_canvas = tk.Canvas(att_card, width=560, height=300, bg="#0f1720", highlightthickness=0)
+        self.att_canvas.pack(fill=tk.BOTH, expand=True)
 
         self.footer_var = tk.StringVar(value="")
         ttk.Label(root, textvariable=self.footer_var, font=("Consolas", 10), padding=(10, 0, 10, 8)).pack(anchor=tk.W)
@@ -367,6 +470,40 @@ class TelemetryApp:
                     100,
                 )
             self._fusion_ready = self._fusion_bias is not None
+
+    def _queue_motor_test(self, motor_index: int, motor_us: int) -> None:
+        self.reader.queue_command(_build_motor_test_packet(motor_index, motor_us))
+        self.reader.queue_command(_build_motor_test_ascii(motor_index, motor_us))
+
+    def _on_test_us_changed(self, value: str) -> None:
+        us = int(float(value))
+        self.test_us_var.set(us)
+        self.test_us_label.configure(text=f"{us:4d} us")
+        if self.test_running:
+            self._queue_motor_test(self.test_motor_var.get(), us)
+
+    def _test_tick(self) -> None:
+        if not self.test_running:
+            self.test_after_id = None
+            return
+        self._queue_motor_test(self.test_motor_var.get(), self.test_us_var.get())
+        self.test_after_id = self.root.after(80, self._test_tick)
+
+    def _on_test_press(self, _event=None) -> None:
+        if self.test_running:
+            return
+        self.test_running = True
+        self._queue_motor_test(self.test_motor_var.get(), self.test_us_var.get())
+        self._test_tick()
+
+    def _on_test_release(self, _event=None) -> None:
+        if not self.test_running:
+            return
+        self.test_running = False
+        if self.test_after_id is not None:
+            self.root.after_cancel(self.test_after_id)
+            self.test_after_id = None
+        self._queue_motor_test(self.test_motor_var.get(), 1000)
 
     @staticmethod
     def _wrap_deg(value: float) -> float:
@@ -572,15 +709,20 @@ class TelemetryApp:
 
         c.create_text(10, 10, anchor="nw", fill="#e5e7eb", font=("Consolas", 11, "bold"), text=f"MODE: {mode_text}")
         c.create_text(220, 10, anchor="nw", fill=arm_color, font=("Consolas", 11, "bold"), text=f"STATE: {arm_text}")
+        c.create_text(cx, 14, anchor="n", fill="#fbbf24", font=("Consolas", 11, "bold"), text="FRONT")
+        c.create_line(cx, 30, cx, 52, fill="#fbbf24", width=3, arrow=tk.FIRST)
         c.create_line(cx - 70, cy - 38, cx + 70, cy + 38, fill="#334155", width=2)
         c.create_line(cx + 70, cy - 38, cx - 70, cy + 38, fill="#334155", width=2)
 
+        # INAV convention: M1 aft-right, M2 forward-right, M3 aft-left, M4 forward-left.
         positions = [
-            (cx + dx, cy - dy),
-            (cx - dx, cy - dy),
-            (cx - dx, cy + dy),
             (cx + dx, cy + dy),
+            (cx + dx, cy - dy),
+            (cx - dx, cy + dy),
+            (cx - dx, cy - dy),
         ]
+
+        role_labels = ["AR", "FR", "AL", "FL"]
 
         for idx, (mx, my) in enumerate(positions):
             us = int(motors_us[idx]) if idx < len(motors_us) else 1000
@@ -588,8 +730,9 @@ class TelemetryApp:
             fill = "#1f2937" if us <= 1000 else mode_color
             c.create_oval(mx - r, my - r, mx + r, my + r, fill=fill, outline="#64748b", width=2)
             c.create_arc(mx - r, my - r, mx + r, my + r, start=90, extent=-360.0 * norm, style=tk.ARC, outline="#22c55e", width=4)
-            c.create_text(mx, my - 3, fill="#e2e8f0", font=("Consolas", 10, "bold"), text=f"M{idx + 1}")
-            c.create_text(mx, my + 12, fill="#cbd5e1", font=("Consolas", 9), text=f"{us:4d} us")
+            c.create_text(mx, my - 8, fill="#e2e8f0", font=("Consolas", 10, "bold"), text=f"M{idx + 1}")
+            c.create_text(mx, my + 4, fill="#93c5fd", font=("Consolas", 9, "bold"), text=role_labels[idx])
+            c.create_text(mx, my + 16, fill="#cbd5e1", font=("Consolas", 9), text=f"{us:4d} us")
 
     def _draw_board_3d(self, pitch: float, roll: float, yaw: float, quaternion=None) -> None:
         c = self.board3d_canvas
@@ -872,6 +1015,7 @@ class TelemetryApp:
                 channels=list(self.state.channels),
                 motor_mode=self.state.motor_mode,
                 motors_armed=self.state.motors_armed,
+                gui_test_active=self.state.gui_test_active,
                 motors_us=list(self.state.motors_us),
                 last_update_monotonic=self.state.last_update_monotonic,
                 connected=self.state.connected,
@@ -885,9 +1029,10 @@ class TelemetryApp:
         port = snapshot.port_name if snapshot.port_name else "n/a"
         motor_mode_text = "REAL" if snapshot.motor_mode == 1 else "SIM"
         motor_state_text = "ARM" if snapshot.motors_armed else "DIS"
+        gui_test_text = "GUI_TEST" if snapshot.gui_test_active else "-"
         self.header_var.set(
             f"SEQ {snapshot.sequence:06d}   RC {link}   RF {snapshot.rc_frames:6d}   "
-            f"MOT {motor_mode_text}/{motor_state_text}   SER {ser} ({port})   Age {age_ms:6.1f} ms"
+            f"MOT {motor_mode_text}/{motor_state_text}/{gui_test_text}   SER {ser} ({port})   Age {age_ms:6.1f} ms"
         )
         self.imu_var.set(
             f"GX {snapshot.gx:6d}  GY {snapshot.gy:6d}  GZ {snapshot.gz:6d}    "
@@ -902,7 +1047,8 @@ class TelemetryApp:
         self.footer_var.set(
             f"{snapshot.status_text} | {fusion_label} | Motor us: "
             f"M1 {snapshot.motors_us[0]:4d} M2 {snapshot.motors_us[1]:4d} "
-            f"M3 {snapshot.motors_us[2]:4d} M4 {snapshot.motors_us[3]:4d}"
+            f"M3 {snapshot.motors_us[2]:4d} M4 {snapshot.motors_us[3]:4d} "
+            f"| GUI test: {'ON' if snapshot.gui_test_active else 'OFF'}"
         )
 
         fusion_quaternion = self._compute_fusion_quaternion(snapshot)
@@ -945,7 +1091,7 @@ def main() -> int:
     reader.start()
 
     root = tk.Tk()
-    app = TelemetryApp(root, state, lock)
+    app = TelemetryApp(root, state, lock, reader)
 
     def _on_close() -> None:
         reader.stop()

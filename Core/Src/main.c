@@ -114,10 +114,10 @@
 /* Diagnostic: also drive legacy PA0-PA3 TIM2 outputs while using INAV S1-S4 map. */
 #define MOTOR_OUTPUT_DUAL_MAP_DIAG      0U
 
-#define MOTOR1_GPIO_PIN                 GPIO_PIN_0   /* S1: TIM3_CH3 */
-#define MOTOR2_GPIO_PIN                 GPIO_PIN_1   /* S2: TIM3_CH4 */
-#define MOTOR3_GPIO_PIN                 GPIO_PIN_3   /* S3: TIM2_CH2 */
-#define MOTOR4_GPIO_PIN                 GPIO_PIN_10  /* S4: TIM2_CH3 */
+#define MOTOR1_GPIO_PIN                 GPIO_PIN_0   /* S1: TIM3_CH3, M1 aft-right */
+#define MOTOR2_GPIO_PIN                 GPIO_PIN_1   /* S2: TIM3_CH4, M2 forward-right */
+#define MOTOR3_GPIO_PIN                 GPIO_PIN_3   /* S3: TIM2_CH2, M3 aft-left */
+#define MOTOR4_GPIO_PIN                 GPIO_PIN_10  /* S4: TIM2_CH3, M4 forward-left */
 #define MOTOR_DSHOT_GPIO_MASK           (MOTOR1_GPIO_PIN | MOTOR2_GPIO_PIN | MOTOR3_GPIO_PIN | MOTOR4_GPIO_PIN)
 
 /* USER CODE END PD */
@@ -229,6 +229,15 @@ static uint16_t g_motor_cmd_us[MOTOR_COUNT] = {
   MOTOR_PWM_MIN_US,
   MOTOR_PWM_MIN_US
 };
+static uint8_t g_motor_gui_test_active = 0U;
+static uint8_t g_motor_gui_test_index = 0U;
+static uint16_t g_motor_gui_test_us = MOTOR_PWM_MIN_US;
+static uint32_t g_motor_gui_test_expire_ms = 0U;
+static uint8_t g_usb_cmd_frame[16] = {0U};
+static uint8_t g_usb_cmd_frame_index = 0U;
+static uint8_t g_usb_cmd_frame_target = 0U;
+static char g_usb_cmd_line[32] = {0};
+static uint8_t g_usb_cmd_line_index = 0U;
 
 static void RC_SetFailsafeNeutral(void)
 {
@@ -247,7 +256,10 @@ static volatile uint32_t g_crsf_last_isr_byte_ms = 0U;
 #define TELEMETRY_PACKET_SOF1           0xA5U
 #define TELEMETRY_PACKET_SOF2           0x5AU
 #define TELEMETRY_PACKET_TYPE_TELEMETRY  0x01U
-#define TELEMETRY_PACKET_PAYLOAD_BYTES   83U
+#define TELEMETRY_PACKET_TYPE_MOTOR_TEST 0x10U
+#define TELEMETRY_PACKET_PAYLOAD_BYTES   84U
+#define MOTOR_TEST_PAYLOAD_BYTES         3U
+#define MOTOR_TEST_TIMEOUT_MS            250U
 
 #define BMP280_I2C_TIMEOUT_MS           20U
 #define BMP280_REG_ID                   0xD0U
@@ -310,6 +322,10 @@ static void IMU_ApplyAlignment(float x, float y, float z, float *xo, float *yo, 
 static void IMU_SetQuaternionFromEuler(float roll_deg, float pitch_deg, float yaw_deg);
 static void MotorControl_UpdateVirtual(void);
 static void MotorControl_Disarm(void);
+static void MotorGui_ProcessUsbCommands(void);
+static void MotorGui_HandleMotorTest(uint8_t motor_index, uint16_t motor_us);
+static void MotorGui_ProcessAsciiByte(uint8_t byte);
+static void MotorGui_TryParseAsciiLine(const char *line);
 static uint8_t MX_TIM2_Init_MotorPwm(void);
 static void MotorOutput_InitAndStart(void);
 static void MotorOutput_WriteMicroseconds(const uint16_t *motor_us);
@@ -320,6 +336,8 @@ static uint8_t MotorDshot_Init(void);
 static void MotorDshot_SendFromUs(const uint16_t *motor_us);
 static uint16_t MotorDshot_EncodeThrottle(uint16_t throttle_value);
 static uint16_t MotorDshot_UsToValue(uint16_t us);
+static uint8_t Packet_CalcXorChecksum(uint8_t packet_type, uint8_t payload_len, const uint8_t *payload);
+static uint16_t Parse_DecU16(const char *text, uint16_t *consumed);
 
 /* USER CODE END PFP */
 
@@ -350,6 +368,231 @@ static float MotorControl_ChannelToThrottle(uint16_t us)
   float normalized = ((float)us - (float)MOTOR_THROTTLE_MIN_US)
                    / (float)(MOTOR_THROTTLE_MAX_US - MOTOR_THROTTLE_MIN_US);
   return MotorControl_ClampF(normalized, 0.0f, 1.0f);
+}
+
+static uint8_t Packet_CalcXorChecksum(uint8_t packet_type, uint8_t payload_len, const uint8_t *payload)
+{
+  uint8_t checksum = (uint8_t)(packet_type ^ payload_len);
+
+  if (payload != NULL)
+  {
+    for (uint8_t i = 0U; i < payload_len; i++)
+    {
+      checksum ^= payload[i];
+    }
+  }
+
+  return checksum;
+}
+
+static uint16_t Parse_DecU16(const char *text, uint16_t *consumed)
+{
+  uint32_t value = 0U;
+  uint16_t i = 0U;
+
+  if (consumed == NULL)
+  {
+    return 0U;
+  }
+
+  while ((text != NULL) && (text[i] >= '0') && (text[i] <= '9'))
+  {
+    value = (value * 10U) + (uint32_t)(text[i] - '0');
+    if (value > 65535U)
+    {
+      value = 65535U;
+    }
+    i++;
+  }
+
+  *consumed = i;
+  return (uint16_t)value;
+}
+
+static void MotorGui_HandleMotorTest(uint8_t motor_index, uint16_t motor_us)
+{
+  if ((motor_index < 1U) || (motor_index > MOTOR_COUNT))
+  {
+    g_motor_gui_test_active = 0U;
+    g_motor_gui_test_us = MOTOR_PWM_MIN_US;
+    g_motor_gui_test_expire_ms = 0U;
+    return;
+  }
+
+  g_motor_gui_test_index = (uint8_t)(motor_index - 1U);
+  g_motor_gui_test_us = (uint16_t)MotorControl_ClampF((float)motor_us, (float)MOTOR_PWM_MIN_US, (float)MOTOR_PWM_MAX_US);
+  g_motor_gui_test_expire_ms = HAL_GetTick() + MOTOR_TEST_TIMEOUT_MS;
+  g_motor_gui_test_active = 1U;
+}
+
+static void MotorGui_TryParseAsciiLine(const char *line)
+{
+  uint16_t consumed = 0U;
+  uint16_t motor_u16 = 0U;
+  uint16_t us_u16 = 0U;
+  uint16_t pos = 0U;
+
+  if (line == NULL)
+  {
+    return;
+  }
+
+  if (strncmp(line, "MTEST ", 6U) == 0)
+  {
+    pos = 6U;
+  }
+  else if (strncmp(line, "MTEST,", 6U) == 0)
+  {
+    pos = 6U;
+  }
+  else
+  {
+    return;
+  }
+
+  while (line[pos] == ' ')
+  {
+    pos++;
+  }
+
+  motor_u16 = Parse_DecU16(&line[pos], &consumed);
+  if (consumed == 0U)
+  {
+    return;
+  }
+  pos = (uint16_t)(pos + consumed);
+
+  while ((line[pos] == ' ') || (line[pos] == ','))
+  {
+    pos++;
+  }
+
+  us_u16 = Parse_DecU16(&line[pos], &consumed);
+  if (consumed == 0U)
+  {
+    return;
+  }
+
+  MotorGui_HandleMotorTest((uint8_t)motor_u16, us_u16);
+}
+
+static void MotorGui_ProcessAsciiByte(uint8_t byte)
+{
+  if ((byte == '\r') || (byte == '\n'))
+  {
+    if (g_usb_cmd_line_index != 0U)
+    {
+      g_usb_cmd_line[g_usb_cmd_line_index] = '\0';
+      MotorGui_TryParseAsciiLine(g_usb_cmd_line);
+      g_usb_cmd_line_index = 0U;
+    }
+    return;
+  }
+
+  if ((byte >= 32U) && (byte <= 126U))
+  {
+    if (g_usb_cmd_line_index < (uint8_t)(sizeof(g_usb_cmd_line) - 1U))
+    {
+      g_usb_cmd_line[g_usb_cmd_line_index++] = (char)byte;
+    }
+    else
+    {
+      g_usb_cmd_line_index = 0U;
+    }
+    return;
+  }
+
+  g_usb_cmd_line_index = 0U;
+}
+
+static void MotorGui_ProcessUsbCommands(void)
+{
+  uint8_t byte = 0U;
+
+  while (CDC_ReadByte_FS(&byte) != 0U)
+  {
+    MotorGui_ProcessAsciiByte(byte);
+
+    if (g_usb_cmd_frame_index == 0U)
+    {
+      if (byte == TELEMETRY_PACKET_SOF1)
+      {
+        g_usb_cmd_frame[0] = byte;
+        g_usb_cmd_frame_index = 1U;
+      }
+      continue;
+    }
+
+    if (g_usb_cmd_frame_index == 1U)
+    {
+      if (byte == TELEMETRY_PACKET_SOF2)
+      {
+        g_usb_cmd_frame[1] = byte;
+        g_usb_cmd_frame_index = 2U;
+      }
+      else if (byte == TELEMETRY_PACKET_SOF1)
+      {
+        g_usb_cmd_frame[0] = byte;
+        g_usb_cmd_frame_index = 1U;
+      }
+      else
+      {
+        g_usb_cmd_frame_index = 0U;
+      }
+      continue;
+    }
+
+    if (g_usb_cmd_frame_index == 2U)
+    {
+      g_usb_cmd_frame[2] = byte;
+      g_usb_cmd_frame_index = 3U;
+      continue;
+    }
+
+    if (g_usb_cmd_frame_index == 3U)
+    {
+      if (byte > 8U)
+      {
+        g_usb_cmd_frame_index = 0U;
+        continue;
+      }
+
+      g_usb_cmd_frame[3] = byte;
+      g_usb_cmd_frame_target = (uint8_t)(4U + byte + 1U);
+      if (g_usb_cmd_frame_target > (uint8_t)sizeof(g_usb_cmd_frame))
+      {
+        g_usb_cmd_frame_index = 0U;
+        continue;
+      }
+
+      g_usb_cmd_frame_index = 4U;
+      continue;
+    }
+
+    g_usb_cmd_frame[g_usb_cmd_frame_index++] = byte;
+
+    if ((g_usb_cmd_frame_target != 0U) && (g_usb_cmd_frame_index >= g_usb_cmd_frame_target))
+    {
+      const uint8_t packet_type = g_usb_cmd_frame[2];
+      const uint8_t payload_len = g_usb_cmd_frame[3];
+      const uint8_t *payload = &g_usb_cmd_frame[4];
+      const uint8_t checksum_rx = g_usb_cmd_frame[g_usb_cmd_frame_target - 1U];
+      const uint8_t checksum_calc = Packet_CalcXorChecksum(packet_type, payload_len, payload);
+
+      if (checksum_rx == checksum_calc)
+      {
+        if ((packet_type == TELEMETRY_PACKET_TYPE_MOTOR_TEST) && (payload_len == MOTOR_TEST_PAYLOAD_BYTES))
+        {
+          const uint8_t motor_index = payload[0];
+          const uint16_t motor_us = (uint16_t)payload[1] | ((uint16_t)payload[2] << 8U);
+          MotorGui_HandleMotorTest(motor_index, motor_us);
+        }
+      }
+
+      g_usb_cmd_frame_index = 0U;
+      g_usb_cmd_frame_target = 0U;
+    }
+  }
 }
 
 static uint16_t MotorDshot_UsToValue(uint16_t us)
@@ -719,6 +962,36 @@ static void MotorControl_UpdateVirtual(void)
 
   float motor_norm[MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
 
+  if (g_motor_gui_test_active != 0U)
+  {
+    if ((int32_t)(now_ms - g_motor_gui_test_expire_ms) >= 0)
+    {
+      g_motor_gui_test_active = 0U;
+      MotorControl_Disarm();
+      return;
+    }
+
+    g_motor_output_mode = MOTOR_OUTPUT_MODE_REAL_THROTTLE;
+    g_motors_armed = 1U;
+    if (g_motor_hw_ready == 0U)
+    {
+      MotorOutput_InitAndStart();
+      if (g_motor_hw_ready == 0U)
+      {
+        MotorControl_Disarm();
+        return;
+      }
+    }
+
+    for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
+    {
+      g_motor_cmd_us[i] = MOTOR_PWM_MIN_US;
+    }
+    g_motor_cmd_us[g_motor_gui_test_index] = g_motor_gui_test_us;
+    MotorOutput_WriteMicroseconds(g_motor_cmd_us);
+    return;
+  }
+
 #if (MOTOR_PWM_SELF_TEST_ENABLE != 0U)
   g_motor_output_mode = MOTOR_OUTPUT_MODE_REAL_THROTTLE;
   g_motors_armed = 1U;
@@ -864,11 +1137,11 @@ static void MotorControl_UpdateVirtual(void)
     return;
   }
 
-  /* Quad-X software mix (FR, FL, RL, RR) in simulation mode. */
-  motor_norm[0] = throttle + pitch_mix + roll_mix - yaw_mix;
-  motor_norm[1] = throttle + pitch_mix - roll_mix + yaw_mix;
-  motor_norm[2] = throttle - pitch_mix - roll_mix - yaw_mix;
-  motor_norm[3] = throttle - pitch_mix + roll_mix + yaw_mix;
+  /* Quad-X software mix in INAV motor order: M1 AR, M2 FR, M3 AL, M4 FL. */
+  motor_norm[0] = throttle - pitch_mix + roll_mix + yaw_mix; /* M1 aft-right */
+  motor_norm[1] = throttle + pitch_mix + roll_mix - yaw_mix; /* M2 forward-right */
+  motor_norm[2] = throttle - pitch_mix - roll_mix - yaw_mix; /* M3 aft-left */
+  motor_norm[3] = throttle + pitch_mix - roll_mix + yaw_mix; /* M4 forward-left */
 
   for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
   {
@@ -1078,6 +1351,7 @@ int main(void)
     uint8_t sample_valid = 0U;
 
     CRSF_ProcessUart();
+    MotorGui_ProcessUsbCommands();
     now_ms = HAL_GetTick();
     if ((g_rc_last_frame_ms != 0U) && ((now_ms - g_rc_last_frame_ms) <= 100U))
     {
@@ -1087,7 +1361,10 @@ int main(void)
     {
       g_rc_link_ok = 0U;
       RC_SetFailsafeNeutral();
-      MotorControl_Disarm();
+      if (g_motor_gui_test_active == 0U)
+      {
+        MotorControl_Disarm();
+      }
     }
 
     MotorControl_UpdateVirtual();
@@ -1774,6 +2051,8 @@ static void Telemetry_SendPacket(int32_t pitch_cd, int32_t roll_cd, int32_t yaw_
   frame[4U + payload_index] = g_motor_output_mode;
   payload_index = (uint8_t)(payload_index + 1U);
   frame[4U + payload_index] = g_motors_armed;
+  payload_index = (uint8_t)(payload_index + 1U);
+  frame[4U + payload_index] = g_motor_gui_test_active;
   payload_index = (uint8_t)(payload_index + 1U);
   for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
   {
