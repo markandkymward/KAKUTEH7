@@ -227,6 +227,13 @@ SECTIONS
   } >DTCMRAM
   PROVIDE( __non_tls_bss_start = ADDR(.bss) );
 
+  .ram_d2 (NOLOAD) : ALIGN(4)
+  {
+    *(.ram_d2)
+    *(.ram_d2*)
+    . = ALIGN(4);
+  } >RAM_D2
+
   PROVIDE( __bss_start = __tbss_start );
   PROVIDE( __bss_size = __bss_end - __bss_start );
 

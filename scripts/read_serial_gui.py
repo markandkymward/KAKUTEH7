@@ -13,11 +13,14 @@ from __future__ import annotations
 import argparse
 import importlib
 import importlib.util
+import json
 import math
+import os
 import struct
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from dataclasses import dataclass, field
 from tkinter import ttk
 from typing import Iterable
@@ -49,14 +52,22 @@ SOF1 = 0xA5
 SOF2 = 0x5A
 PACKET_TYPE_TELEMETRY = 0x01
 PACKET_TYPE_MOTOR_TEST = 0x10
+PACKET_TYPE_DISPLAY_FILTER = 0x11
 TELEMETRY_PAYLOAD_LEN_V1 = 73
 TELEMETRY_PAYLOAD_LEN_V2 = 83
 TELEMETRY_PAYLOAD_LEN_V3 = 84
+TELEMETRY_PAYLOAD_LEN_V4 = 92
+TELEMETRY_PAYLOAD_LEN_V5 = 94
+TELEMETRY_PAYLOAD_LEN_V6 = 98
 TELEMETRY_STRUCT_V1 = struct.Struct("<Iiii6hBIIi16H")
 TELEMETRY_STRUCT_V2 = struct.Struct("<Iiii6hBIIi16HBB4H")
 TELEMETRY_STRUCT_V3 = struct.Struct("<Iiii6hBIIi16HBBB4H")
+TELEMETRY_STRUCT_V4 = struct.Struct("<Iiii9hBIIi16HBBB5H")
+TELEMETRY_STRUCT_V5 = struct.Struct("<Iiii9hBIIiH16HBBB5H")
+TELEMETRY_STRUCT_V6 = struct.Struct("<Iiii9hBIIiH16HBBB5HHBB")
 IMU_ACCEL_LSB_PER_G = 2048.0
 IMU_GYRO_DPS_PER_LSB = 2000.0 / 32768.0
+LAYOUT_SCHEMA_VERSION = 2
 
 
 def _checksum(packet_type: int, payload: bytes) -> int:
@@ -131,6 +142,18 @@ def _decode_frames(buffer: bytearray) -> Iterable[tuple[int, ...]]:
             yield TELEMETRY_STRUCT_V3.unpack(payload)
             continue
 
+        if payload_len == TELEMETRY_PAYLOAD_LEN_V4:
+            yield TELEMETRY_STRUCT_V4.unpack(payload)
+            continue
+
+        if payload_len == TELEMETRY_PAYLOAD_LEN_V5:
+            yield TELEMETRY_STRUCT_V5.unpack(payload)
+            continue
+
+        if payload_len == TELEMETRY_PAYLOAD_LEN_V6:
+            yield TELEMETRY_STRUCT_V6.unpack(payload)
+            continue
+
 
 def _build_motor_test_packet(motor_index: int, motor_us: int) -> bytes:
     payload = bytes(
@@ -153,6 +176,21 @@ def _build_motor_test_ascii(motor_index: int, motor_us: int) -> bytes:
     return f"MTEST {idx} {us}\n".encode("ascii")
 
 
+def _build_display_filter_packet(cutoff_hz: int) -> bytes:
+    cutoff = max(5, min(150, int(cutoff_hz)))
+    payload = bytes((cutoff & 0xFF, (cutoff >> 8) & 0xFF))
+    packet_type = PACKET_TYPE_DISPLAY_FILTER
+    frame = bytearray((SOF1, SOF2, packet_type, len(payload)))
+    frame.extend(payload)
+    frame.append(_checksum(packet_type, payload))
+    return bytes(frame)
+
+
+def _build_display_filter_ascii(cutoff_hz: int) -> bytes:
+    cutoff = max(5, min(150, int(cutoff_hz)))
+    return f"DFLT {cutoff}\n".encode("ascii")
+
+
 @dataclass
 class TelemetryState:
     sequence: int = 0
@@ -162,17 +200,27 @@ class TelemetryState:
     gx: int = 0
     gy: int = 0
     gz: int = 0
+    gx_filtered: int = 0
+    gy_filtered: int = 0
+    gz_filtered: int = 0
     ax: int = 0
     ay: int = 0
     az: int = 0
+    display_filter_cutoff_hz: int = 40
     pressure_pa: int = 0
     altitude_cm: int = 0
+    battery_mv: int | None = None
+    battery_voltage_v: float | None = None
+    battery_adc_raw: int = 0
+    battery_adc_channel: int = 255
+    battery_adc_ready: int = 0
     rc_link_ok: bool = False
     rc_frames: int = 0
     channels: list[int] = field(default_factory=lambda: [0] * 16)
     motor_mode: int = 0
     motors_armed: int = 0
     gui_test_active: int = 0
+    gyro_filter_available: bool = False
     motors_us: list[int] = field(default_factory=lambda: [1000, 1000, 1000, 1000])
     last_update_monotonic: float = 0.0
     connected: bool = False
@@ -262,23 +310,120 @@ class SerialReader(threading.Thread):
                                 continue
                             buffer.extend(chunk)
                             for values in _decode_frames(buffer):
-                                (
-                                    sequence,
-                                    pitch_cd,
-                                    roll_cd,
-                                    yaw_cd,
-                                    gx,
-                                    gy,
-                                    gz,
-                                    ax,
-                                    ay,
-                                    az,
-                                    rc_link,
-                                    rc_frames,
-                                    pressure_pa,
-                                    altitude_cm,
-                                    *channels,
-                                ) = values
+                                if len(values) == 45:
+                                    (
+                                        sequence,
+                                        pitch_cd,
+                                        roll_cd,
+                                        yaw_cd,
+                                        gx,
+                                        gy,
+                                        gz,
+                                        gx_filtered,
+                                        gy_filtered,
+                                        gz_filtered,
+                                        ax,
+                                        ay,
+                                        az,
+                                        rc_link,
+                                        rc_frames,
+                                        pressure_pa,
+                                        altitude_cm,
+                                        battery_mv,
+                                        *channels,
+                                    ) = values
+                                    display_filter_cutoff_hz = int(channels[23])
+                                    battery_adc_raw = int(channels[24])
+                                    battery_adc_channel = int(channels[25])
+                                    battery_adc_ready = int(channels[26])
+                                    battery_mv = int(battery_mv)
+                                    battery_voltage_v = float(battery_mv) * 0.001
+                                    gyro_filter_available = True
+                                elif len(values) == 42:
+                                    (
+                                        sequence,
+                                        pitch_cd,
+                                        roll_cd,
+                                        yaw_cd,
+                                        gx,
+                                        gy,
+                                        gz,
+                                        gx_filtered,
+                                        gy_filtered,
+                                        gz_filtered,
+                                        ax,
+                                        ay,
+                                        az,
+                                        rc_link,
+                                        rc_frames,
+                                        pressure_pa,
+                                        altitude_cm,
+                                        battery_mv,
+                                        *channels,
+                                    ) = values
+                                    display_filter_cutoff_hz = int(channels[23])
+                                    battery_adc_raw = 0
+                                    battery_adc_channel = 255
+                                    battery_adc_ready = 0
+                                    battery_mv = int(battery_mv)
+                                    battery_voltage_v = float(battery_mv) * 0.001
+                                    gyro_filter_available = True
+                                elif len(values) == 41:
+                                    (
+                                        sequence,
+                                        pitch_cd,
+                                        roll_cd,
+                                        yaw_cd,
+                                        gx,
+                                        gy,
+                                        gz,
+                                        gx_filtered,
+                                        gy_filtered,
+                                        gz_filtered,
+                                        ax,
+                                        ay,
+                                        az,
+                                        rc_link,
+                                        rc_frames,
+                                        pressure_pa,
+                                        altitude_cm,
+                                        *channels,
+                                    ) = values
+                                    display_filter_cutoff_hz = int(channels[23])
+                                    battery_adc_raw = 0
+                                    battery_adc_channel = 255
+                                    battery_adc_ready = 0
+                                    battery_mv = None
+                                    battery_voltage_v = None
+                                    gyro_filter_available = True
+                                else:
+                                    (
+                                        sequence,
+                                        pitch_cd,
+                                        roll_cd,
+                                        yaw_cd,
+                                        gx,
+                                        gy,
+                                        gz,
+                                        ax,
+                                        ay,
+                                        az,
+                                        rc_link,
+                                        rc_frames,
+                                        pressure_pa,
+                                        altitude_cm,
+                                        *channels,
+                                    ) = values
+                                    gx_filtered = gx
+                                    gy_filtered = gy
+                                    gz_filtered = gz
+                                    display_filter_cutoff_hz = 40
+                                    battery_adc_raw = 0
+                                    battery_adc_channel = 255
+                                    battery_adc_ready = 0
+                                    battery_mv = None
+                                    battery_voltage_v = None
+                                    gyro_filter_available = False
 
                                 motor_mode = int(channels[16])
                                 motors_armed = int(channels[17])
@@ -294,17 +439,27 @@ class SerialReader(threading.Thread):
                                     self.state.gx = int(gx)
                                     self.state.gy = int(gy)
                                     self.state.gz = int(gz)
+                                    self.state.gx_filtered = int(gx_filtered)
+                                    self.state.gy_filtered = int(gy_filtered)
+                                    self.state.gz_filtered = int(gz_filtered)
                                     self.state.ax = int(ax)
                                     self.state.ay = int(ay)
                                     self.state.az = int(az)
+                                    self.state.display_filter_cutoff_hz = int(display_filter_cutoff_hz)
                                     self.state.pressure_pa = int(pressure_pa)
                                     self.state.altitude_cm = int(altitude_cm)
+                                    self.state.battery_mv = battery_mv
+                                    self.state.battery_voltage_v = battery_voltage_v
+                                    self.state.battery_adc_raw = int(battery_adc_raw)
+                                    self.state.battery_adc_channel = int(battery_adc_channel)
+                                    self.state.battery_adc_ready = int(battery_adc_ready)
                                     self.state.rc_link_ok = bool(rc_link)
                                     self.state.rc_frames = int(rc_frames)
                                     self.state.channels = [int(v) for v in channels]
                                     self.state.motor_mode = motor_mode
                                     self.state.motors_armed = motors_armed
                                     self.state.gui_test_active = gui_test_active
+                                    self.state.gyro_filter_available = bool(gyro_filter_available)
                                     self.state.motors_us = motors_us
                                     self.state.last_update_monotonic = time.monotonic()
                                     self.state.connected = True
@@ -341,33 +496,92 @@ class TelemetryApp:
         root.geometry("1180x760")
         root.minsize(980, 640)
 
+        self._layout_path = os.path.join(os.path.dirname(__file__), ".read_serial_gui_layout.json")
+        self._saved_layout: dict[str, object] = self._load_layout_config()
+        self._pane_order: list[tuple[str, ttk.Panedwindow]] = []
+        self._layout_restore_pending = True
+
         self.header_var = tk.StringVar(value="Waiting for data...")
         self.imu_var = tk.StringVar(value="")
         self.baro_var = tk.StringVar(value="")
+        self.battery_var = tk.StringVar(value="BAT n/a")
+        self.filter_target_var = tk.StringVar(value="Requested cutoff: 40 Hz")
+        self.filter_fw_var = tk.StringVar(value="Firmware cutoff: 40 Hz")
 
         header = ttk.Frame(root, padding=10)
         header.pack(fill=tk.X)
         ttk.Label(header, textvariable=self.header_var, font=("Segoe UI", 13, "bold")).pack(anchor=tk.W)
         ttk.Label(header, textvariable=self.imu_var, font=("Consolas", 11)).pack(anchor=tk.W)
-        ttk.Label(header, textvariable=self.baro_var, font=("Consolas", 11)).pack(anchor=tk.W)
+        env_row = ttk.Frame(header)
+        env_row.pack(fill=tk.X)
+        ttk.Label(env_row, textvariable=self.baro_var, font=("Consolas", 11)).pack(side=tk.LEFT, anchor=tk.W)
+        ttk.Label(env_row, textvariable=self.battery_var, font=("Consolas", 11)).pack(side=tk.RIGHT, anchor=tk.E)
 
         body = ttk.Frame(root, padding=(10, 0, 10, 10))
         body.pack(fill=tk.BOTH, expand=True)
 
-        left = ttk.Frame(body)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        root_stack = ttk.Panedwindow(body, orient=tk.VERTICAL)
+        root_stack.pack(fill=tk.BOTH, expand=True)
+        self._pane_order.append(("root_stack", root_stack))
 
-        right = ttk.Frame(body)
-        right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        top_row = ttk.Panedwindow(root_stack, orient=tk.HORIZONTAL)
+        root_stack.add(top_row, weight=4)
+        self._pane_order.append(("top_row", top_row))
 
-        self.stick_canvas = tk.Canvas(left, width=560, height=280, bg="#151a22", highlightthickness=0)
-        self.stick_canvas.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        board3d_card = ttk.Frame(top_row)
+        ttk.Label(board3d_card, text="Kakute 3D Body", font=("Segoe UI", 12, "bold")).pack(anchor=tk.W, pady=(0, 6))
+        self.board3d_canvas = tk.Canvas(board3d_card, width=420, height=280, bg="#0b1220", highlightthickness=0)
+        self.board3d_canvas.pack(fill=tk.BOTH, expand=True)
+        top_row.add(board3d_card, weight=1)
 
-        left_motor_card = ttk.Frame(left)
-        left_motor_card.pack(fill=tk.BOTH, expand=True)
+        channel_card = ttk.Frame(top_row)
+        ttk.Label(channel_card, text="Channels", font=("Segoe UI", 12, "bold")).pack(anchor=tk.W, pady=(0, 6))
+        self.channel_canvas = tk.Canvas(channel_card, bg="#0f1319", highlightthickness=0)
+        self.channel_canvas.pack(fill=tk.BOTH, expand=True)
+        top_row.add(channel_card, weight=1)
 
-        control_card = ttk.LabelFrame(left_motor_card, text="Single Motor Test (USB)")
-        control_card.pack(fill=tk.X, expand=False, pady=(0, 8))
+        att_card = ttk.Frame(top_row)
+        ttk.Label(att_card, text="Attitude Indicator", font=("Segoe UI", 12, "bold")).pack(anchor=tk.W, pady=(0, 6))
+        self.att_canvas = tk.Canvas(att_card, width=420, height=280, bg="#0f1720", highlightthickness=0)
+        self.att_canvas.pack(fill=tk.BOTH, expand=True)
+        top_row.add(att_card, weight=1)
+
+        filter_card = ttk.Frame(root_stack)
+        ttk.Label(filter_card, text="Display Filter", font=("Segoe UI", 12, "bold")).pack(anchor=tk.W, pady=(0, 6))
+
+        filter_row = ttk.Frame(filter_card)
+        filter_row.pack(fill=tk.X, padx=2, pady=(0, 6))
+        ttk.Label(filter_row, textvariable=self.filter_target_var, font=("Consolas", 10, "bold")).pack(side=tk.LEFT)
+        ttk.Label(filter_row, textvariable=self.filter_fw_var, font=("Consolas", 10), foreground="#94a3b8").pack(side=tk.RIGHT)
+
+        self.filter_scale = ttk.Scale(
+            filter_card,
+            from_=5,
+            to=150,
+            orient=tk.HORIZONTAL,
+            command=self._on_filter_cutoff_changed,
+        )
+        self.filter_scale.set(40)
+        self.filter_scale.pack(fill=tk.X, padx=2, pady=(0, 6))
+
+        self.gyro_canvas = tk.Canvas(filter_card, height=220, bg="#0f1720", highlightthickness=0)
+        self.gyro_canvas.pack(fill=tk.BOTH, expand=True)
+        root_stack.add(filter_card, weight=2)
+
+        bottom_row = ttk.Panedwindow(root_stack, orient=tk.HORIZONTAL)
+        root_stack.add(bottom_row, weight=3)
+        self._pane_order.append(("bottom_row", bottom_row))
+
+        stick_card = ttk.Frame(bottom_row)
+        self.stick_canvas = tk.Canvas(stick_card, width=560, height=280, bg="#151a22", highlightthickness=0)
+        self.stick_canvas.pack(fill=tk.BOTH, expand=True)
+        bottom_row.add(stick_card, weight=2)
+
+        controls_and_motors = ttk.Panedwindow(bottom_row, orient=tk.VERTICAL)
+        bottom_row.add(controls_and_motors, weight=2)
+        self._pane_order.append(("controls_and_motors", controls_and_motors))
+
+        control_card = ttk.LabelFrame(controls_and_motors, text="Single Motor Test (USB)")
 
         self.test_motor_var = tk.IntVar(value=1)
         self.test_us_var = tk.IntVar(value=1100)
@@ -406,33 +620,13 @@ class TelemetryApp:
         self.test_button.bind("<ButtonRelease-1>", self._on_test_release)
         self.test_button.bind("<Leave>", self._on_test_release)
         ttk.Label(row2, text="Sends command every 80 ms with 250 ms firmware timeout.").pack(side=tk.LEFT, padx=(10, 0))
+        controls_and_motors.add(control_card, weight=1)
 
-        motor_card = ttk.Frame(left_motor_card)
-        motor_card.pack(fill=tk.BOTH, expand=True)
+        motor_card = ttk.Frame(controls_and_motors)
         ttk.Label(motor_card, text="Motors (M1-M4)", font=("Segoe UI", 12, "bold")).pack(anchor=tk.W, pady=(0, 6))
         self.motor_canvas = tk.Canvas(motor_card, width=520, height=220, bg="#10161d", highlightthickness=0)
         self.motor_canvas.pack(fill=tk.BOTH, expand=True)
-
-        board3d_card = ttk.Frame(right)
-        board3d_card.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-
-        ttk.Label(board3d_card, text="Kakute 3D Body", font=("Segoe UI", 12, "bold")).pack(anchor=tk.W, pady=(0, 6))
-        self.board3d_canvas = tk.Canvas(board3d_card, width=520, height=290, bg="#0b1220", highlightthickness=0)
-        self.board3d_canvas.pack(fill=tk.BOTH, expand=True)
-
-        channel_card = ttk.Frame(right)
-        channel_card.pack(fill=tk.BOTH, expand=True)
-
-        ttk.Label(channel_card, text="Channels", font=("Segoe UI", 12, "bold")).pack(anchor=tk.W, pady=(0, 6))
-
-        self.channel_canvas = tk.Canvas(channel_card, bg="#0f1319", highlightthickness=0)
-        self.channel_canvas.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-
-        att_card = ttk.Frame(right)
-        att_card.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(att_card, text="Attitude Indicator", font=("Segoe UI", 12, "bold")).pack(anchor=tk.W, pady=(0, 6))
-        self.att_canvas = tk.Canvas(att_card, width=560, height=300, bg="#0f1720", highlightthickness=0)
-        self.att_canvas.pack(fill=tk.BOTH, expand=True)
+        controls_and_motors.add(motor_card, weight=2)
 
         self.footer_var = tk.StringVar(value="")
         ttk.Label(root, textvariable=self.footer_var, font=("Consolas", 10), padding=(10, 0, 10, 8)).pack(anchor=tk.W)
@@ -444,6 +638,10 @@ class TelemetryApp:
         self._fusion_bias = None
         self._fusion_last_monotonic = 0.0
         self._fusion_ready = False
+        self._gyro_raw_history = deque(maxlen=240)
+        self._gyro_filtered_history = deque(maxlen=240)
+        self._filter_command_after_id: str | None = None
+        self._last_filter_sent = 40
         if imufusion is not None:
             if hasattr(imufusion, "Bias") and hasattr(imufusion, "BiasSettings"):
                 self._fusion_bias = imufusion.Bias()
@@ -471,9 +669,100 @@ class TelemetryApp:
                 )
             self._fusion_ready = self._fusion_bias is not None
 
+        self._apply_saved_layout_async()
+
+    def _load_layout_config(self) -> dict[str, object]:
+        try:
+            with open(self._layout_path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict) and int(loaded.get("schema", 0)) == LAYOUT_SCHEMA_VERSION:
+                return loaded
+        except Exception:
+            pass
+        return {}
+
+    def _save_layout_config(self) -> None:
+        panes: dict[str, list[int]] = {}
+        for name, pane in self._pane_order:
+            try:
+                pane_count = len(pane.panes())
+                if pane_count < 2:
+                    continue
+                panes[name] = [int(pane.sashpos(i)) for i in range(pane_count - 1)]
+            except Exception:
+                continue
+
+        payload = {
+            "schema": LAYOUT_SCHEMA_VERSION,
+            "geometry": self.root.winfo_geometry(),
+            "panes": panes,
+        }
+        try:
+            with open(self._layout_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+        except Exception:
+            pass
+
+    def _apply_saved_layout_async(self) -> None:
+        geometry = self._saved_layout.get("geometry")
+        if isinstance(geometry, str) and geometry:
+            try:
+                self.root.geometry(geometry)
+            except Exception:
+                pass
+        self.root.after(120, self._apply_saved_panes)
+
+    def _apply_saved_panes(self) -> None:
+        self.root.update_idletasks()
+        pane_data = self._saved_layout.get("panes")
+        if not isinstance(pane_data, dict):
+            self._layout_restore_pending = False
+            return
+
+        for name, pane in self._pane_order:
+            saved_positions = pane_data.get(name)
+            if not isinstance(saved_positions, list):
+                continue
+
+            pane_orient = str(pane.cget("orient"))
+            pane_span = pane.winfo_width() if pane_orient == "horizontal" else pane.winfo_height()
+            if pane_span <= 0:
+                continue
+
+            edge_margin = 120
+            for idx, value in enumerate(saved_positions):
+                try:
+                    requested = int(value)
+                    clamped = max(edge_margin, min(pane_span - edge_margin, requested))
+                    pane.sashpos(idx, clamped)
+                except Exception:
+                    continue
+
+        self._layout_restore_pending = False
+
+    def on_close(self) -> None:
+        self._save_layout_config()
+
     def _queue_motor_test(self, motor_index: int, motor_us: int) -> None:
         self.reader.queue_command(_build_motor_test_packet(motor_index, motor_us))
         self.reader.queue_command(_build_motor_test_ascii(motor_index, motor_us))
+
+    def _queue_display_filter(self, cutoff_hz: int) -> None:
+        self.reader.queue_command(_build_display_filter_packet(cutoff_hz))
+        self.reader.queue_command(_build_display_filter_ascii(cutoff_hz))
+
+    def _send_display_filter_now(self, cutoff_hz: int) -> None:
+        cutoff = max(5, min(150, int(cutoff_hz)))
+        self._last_filter_sent = cutoff
+        self.filter_target_var.set(f"Requested cutoff: {cutoff} Hz")
+        self._queue_display_filter(cutoff)
+
+    def _on_filter_cutoff_changed(self, value: str) -> None:
+        cutoff = int(float(value))
+        self.filter_target_var.set(f"Requested cutoff: {cutoff} Hz")
+        if self._filter_command_after_id is not None:
+            self.root.after_cancel(self._filter_command_after_id)
+        self._filter_command_after_id = self.root.after(35, lambda cutoff=cutoff: self._send_display_filter_now(cutoff))
 
     def _on_test_us_changed(self, value: str) -> None:
         us = int(float(value))
@@ -734,6 +1023,77 @@ class TelemetryApp:
             c.create_text(mx, my + 4, fill="#93c5fd", font=("Consolas", 9, "bold"), text=role_labels[idx])
             c.create_text(mx, my + 16, fill="#cbd5e1", font=("Consolas", 9), text=f"{us:4d} us")
 
+    def _append_gyro_history(self, snapshot: TelemetryState) -> None:
+        raw_scale = IMU_GYRO_DPS_PER_LSB
+        raw_sample = (snapshot.gx * raw_scale, snapshot.gy * raw_scale, snapshot.gz * raw_scale)
+        if snapshot.gyro_filter_available:
+            filtered_sample = (
+                snapshot.gx_filtered * raw_scale,
+                snapshot.gy_filtered * raw_scale,
+                snapshot.gz_filtered * raw_scale,
+            )
+        else:
+            filtered_sample = raw_sample
+
+        self._gyro_raw_history.append(raw_sample)
+        self._gyro_filtered_history.append(filtered_sample)
+
+    def _draw_gyro_graph(self, snapshot: TelemetryState) -> None:
+        c = self.gyro_canvas
+        c.delete("all")
+        w = c.winfo_width()
+        h = c.winfo_height()
+        split = h // 2
+
+        c.create_rectangle(0, 0, w, h, fill="#0f1720", outline="")
+        c.create_text(10, 8, anchor="nw", fill="#e5e7eb", font=("Consolas", 11, "bold"), text=f"Gyro Display Filter  {snapshot.display_filter_cutoff_hz} Hz")
+
+        def draw_plot(y0: int, y1: int, history: deque[tuple[float, float, float]], title: str) -> None:
+            pad_x = 18
+            top = y0 + 22
+            bottom = y1 - 14
+            left = pad_x
+            right = w - pad_x
+            center_y = (top + bottom) / 2.0
+            if len(history) > 0:
+                max_abs_dps = max(abs(v) for sample in history for v in sample)
+            else:
+                max_abs_dps = 0.0
+
+            amp_dps = max(20.0, min(2000.0, max_abs_dps * 1.2))
+            pixels_per_dps = ((bottom - top) * 0.5) / amp_dps
+            c.create_text(left, y0 + 4, anchor="nw", fill="#cbd5e1", font=("Consolas", 10, "bold"), text=title)
+            c.create_line(left, center_y, right, center_y, fill="#475569")
+            c.create_line(left, top, right, top, fill="#1f2937")
+            c.create_line(left, bottom, right, bottom, fill="#1f2937")
+            c.create_text(left, top + 2, anchor="nw", fill="#94a3b8", font=("Consolas", 9), text=f"+/-{amp_dps:5.1f} dps")
+
+            if len(history) < 2:
+                return
+
+            denom = max(1, len(history) - 1)
+            axis_colors = ("#f87171", "#4ade80", "#60a5fa")
+            for axis in range(3):
+                points: list[float] = []
+                for idx, sample in enumerate(history):
+                    value = sample[axis]
+                    x_pos = left + (right - left) * (idx / denom)
+                    clamped = max(-amp_dps, min(amp_dps, value))
+                    y_pos = center_y - clamped * pixels_per_dps
+                    points.extend((x_pos, y_pos))
+                c.create_line(*points, fill=axis_colors[axis], width=2, smooth=True)
+
+            legend_x = right - 172
+            legend_y = y0 + 4
+            legend = (("X", "#f87171"), ("Y", "#4ade80"), ("Z", "#60a5fa"))
+            for idx, (label, color) in enumerate(legend):
+                x = legend_x + idx * 56
+                c.create_line(x, legend_y + 8, x + 16, legend_y + 8, fill=color, width=3)
+                c.create_text(x + 20, legend_y + 8, anchor="w", fill="#cbd5e1", font=("Consolas", 9), text=label)
+
+        draw_plot(0, split, self._gyro_raw_history, "Raw Gyro (dps)")
+        draw_plot(split, h, self._gyro_filtered_history, "Filtered Gyro (dps)")
+
     def _draw_board_3d(self, pitch: float, roll: float, yaw: float, quaternion=None) -> None:
         c = self.board3d_canvas
         c.delete("all")
@@ -910,9 +1270,13 @@ class TelemetryApp:
                 dt = 0.05
         self._fusion_last_monotonic = now
 
-        gx_dps = snapshot.gx * IMU_GYRO_DPS_PER_LSB
-        gy_dps = snapshot.gy * IMU_GYRO_DPS_PER_LSB
-        gz_dps = snapshot.gz * IMU_GYRO_DPS_PER_LSB
+        gx_source = snapshot.gx_filtered if snapshot.gyro_filter_available else snapshot.gx
+        gy_source = snapshot.gy_filtered if snapshot.gyro_filter_available else snapshot.gy
+        gz_source = snapshot.gz_filtered if snapshot.gyro_filter_available else snapshot.gz
+
+        gx_dps = gx_source * IMU_GYRO_DPS_PER_LSB
+        gy_dps = gy_source * IMU_GYRO_DPS_PER_LSB
+        gz_dps = gz_source * IMU_GYRO_DPS_PER_LSB
         ax_g = snapshot.ax / IMU_ACCEL_LSB_PER_G
         ay_g = snapshot.ay / IMU_ACCEL_LSB_PER_G
         az_g = snapshot.az / IMU_ACCEL_LSB_PER_G
@@ -959,9 +1323,13 @@ class TelemetryApp:
                 dt = 0.05
         self._fusion_last_monotonic = now
 
-        gx_dps = snapshot.gx * IMU_GYRO_DPS_PER_LSB
-        gy_dps = snapshot.gy * IMU_GYRO_DPS_PER_LSB
-        gz_dps = snapshot.gz * IMU_GYRO_DPS_PER_LSB
+        gx_source = snapshot.gx_filtered if snapshot.gyro_filter_available else snapshot.gx
+        gy_source = snapshot.gy_filtered if snapshot.gyro_filter_available else snapshot.gy
+        gz_source = snapshot.gz_filtered if snapshot.gyro_filter_available else snapshot.gz
+
+        gx_dps = gx_source * IMU_GYRO_DPS_PER_LSB
+        gy_dps = gy_source * IMU_GYRO_DPS_PER_LSB
+        gz_dps = gz_source * IMU_GYRO_DPS_PER_LSB
         ax_g = snapshot.ax / IMU_ACCEL_LSB_PER_G
         ay_g = snapshot.ay / IMU_ACCEL_LSB_PER_G
         az_g = snapshot.az / IMU_ACCEL_LSB_PER_G
@@ -1005,17 +1373,27 @@ class TelemetryApp:
                 gx=self.state.gx,
                 gy=self.state.gy,
                 gz=self.state.gz,
+                gx_filtered=self.state.gx_filtered,
+                gy_filtered=self.state.gy_filtered,
+                gz_filtered=self.state.gz_filtered,
                 ax=self.state.ax,
                 ay=self.state.ay,
                 az=self.state.az,
+                display_filter_cutoff_hz=self.state.display_filter_cutoff_hz,
                 pressure_pa=self.state.pressure_pa,
                 altitude_cm=self.state.altitude_cm,
+                battery_mv=self.state.battery_mv,
+                battery_voltage_v=self.state.battery_voltage_v,
+                battery_adc_raw=self.state.battery_adc_raw,
+                battery_adc_channel=self.state.battery_adc_channel,
+                battery_adc_ready=self.state.battery_adc_ready,
                 rc_link_ok=self.state.rc_link_ok,
                 rc_frames=self.state.rc_frames,
                 channels=list(self.state.channels),
                 motor_mode=self.state.motor_mode,
                 motors_armed=self.state.motors_armed,
                 gui_test_active=self.state.gui_test_active,
+                gyro_filter_available=self.state.gyro_filter_available,
                 motors_us=list(self.state.motors_us),
                 last_update_monotonic=self.state.last_update_monotonic,
                 connected=self.state.connected,
@@ -1041,6 +1419,13 @@ class TelemetryApp:
         self.baro_var.set(
             f"BARO P {snapshot.pressure_pa:7d} Pa   ALT {snapshot.altitude_cm / 100.0:+7.2f} m"
         )
+        if snapshot.battery_voltage_v is None:
+            self.battery_var.set("BAT n/a (telemetry has no battery field/value yet)")
+        elif (snapshot.battery_mv is not None) and (snapshot.battery_mv == 0):
+            self.battery_var.set("BAT 0.00 V")
+        else:
+            self.battery_var.set(f"BAT {snapshot.battery_voltage_v:0.2f} V")
+        self.filter_fw_var.set(f"Firmware cutoff: {snapshot.display_filter_cutoff_hz} Hz")
         fusion_label = "FusionGUI:ON" if self._fusion_ready else "FusionGUI:OFF"
         if (not self._fusion_ready) and imufusion_error:
             fusion_label = f"{fusion_label} ({imufusion_error})"
@@ -1051,15 +1436,22 @@ class TelemetryApp:
             f"| GUI test: {'ON' if snapshot.gui_test_active else 'OFF'}"
         )
 
-        fusion_quaternion = self._compute_fusion_quaternion(snapshot)
-        if fusion_quaternion is not None:
-            source_pitch, source_roll, source_yaw = self._quaternion_to_euler_display(fusion_quaternion)
-        else:
+        # Keep startup attitude aligned with firmware's calibrated level estimate.
+        if snapshot.gyro_filter_available:
+            fusion_quaternion = None
             source_pitch, source_roll, source_yaw = snapshot.pitch_deg, snapshot.roll_deg, snapshot.yaw_deg
+        else:
+            fusion_quaternion = self._compute_fusion_quaternion(snapshot)
+            if fusion_quaternion is not None:
+                source_pitch, source_roll, source_yaw = self._quaternion_to_euler_display(fusion_quaternion)
+            else:
+                source_pitch, source_roll, source_yaw = snapshot.pitch_deg, snapshot.roll_deg, snapshot.yaw_deg
 
+        self._append_gyro_history(snapshot)
         self._draw_attitude(source_pitch, source_roll, source_yaw)
         self._draw_sticks(snapshot.channels)
         self._draw_board_3d(source_pitch, source_roll, source_yaw, fusion_quaternion)
+        self._draw_gyro_graph(snapshot)
         self._draw_channels(snapshot.channels)
         self._draw_motors(snapshot.motor_mode, snapshot.motors_armed, snapshot.motors_us)
 
@@ -1094,6 +1486,7 @@ def main() -> int:
     app = TelemetryApp(root, state, lock, reader)
 
     def _on_close() -> None:
+        app.on_close()
         reader.stop()
         root.destroy()
 

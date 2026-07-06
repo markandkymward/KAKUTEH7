@@ -27,6 +27,7 @@
 #include <math.h>
 #include "usbd_cdc_if.h"
 #include "Fusion.h"
+#include "display_filter.h"
 
 /* USER CODE END Includes */
 
@@ -58,6 +59,15 @@
 #define IMU_REG_ACCEL_CONFIG0   0x50U
 #define IMU_ACCEL_LSB_PER_G     2048.0f
 #define IMU_GYRO_DPS_PER_LSB    (2000.0f / 32768.0f)
+
+#define BATTERY_ADC_PORT                GPIOC
+#define BATTERY_ADC_PIN                 GPIO_PIN_0
+#define BATTERY_ADC_CHANNEL             ADC_CHANNEL_10
+#define BATTERY_VREF_MV                 3300U
+#define BATTERY_ADC_MAX_COUNTS          4095U
+/* Calibrated from measured 11.34V vs previously reported 14.69V. */
+#define BATTERY_DIVIDER_NUM             849U
+#define BATTERY_DIVIDER_DEN             100U
 
 #define IMU_ALIGN_CW0           0U
 #define IMU_ALIGN_CW90          1U
@@ -102,15 +112,13 @@
 #define MOTOR_PWM_SELF_TEST_US          1600U
 #define MOTOR_INIT_AT_BOOT              1U
 #define MOTOR_HW_OUTPUT_ENABLE          1U
-#define MOTOR_PROTOCOL_DSHOT300_TEST    0U
-#define MOTOR_DSHOT_BITRATE_HZ          300000U
+#define MOTOR_BACKEND_PWM               0U
+#define MOTOR_BACKEND_DSHOT             1U
+#define MOTOR_BACKEND                   MOTOR_BACKEND_PWM
 #define MOTOR_PWM_RATE_HZ               50U
 #define MOTOR_TIMER_TICK_HZ             1000000U
 #define MOTOR_SPIN_FLOOR_US             1070U
-#define MOTOR_DSHOT_MIN_ACTIVE_VALUE    300U
-#define MOTOR_DSHOT_BURST_FRAMES        4U
-#define MOTOR_DSHOT_ARM_PRIME_MS        400U
-#define MOTOR_DSHOT_ARM_PRIME_US        1250U
+#define MOTOR_DSHOT_MIN_ACTIVE_VALUE    48U
 /* Diagnostic: also drive legacy PA0-PA3 TIM2 outputs while using INAV S1-S4 map. */
 #define MOTOR_OUTPUT_DUAL_MAP_DIAG      0U
 
@@ -217,12 +225,6 @@ static volatile uint16_t g_crsf_rx_tail = 0U;
 static uint8_t g_motors_armed = 0U;
 static uint8_t g_motor_output_mode = MOTOR_OUTPUT_MODE_SIMULATION;
 static uint8_t g_motor_hw_ready = 0U;
-static uint8_t g_motor_dshot_ready = 0U;
-static uint32_t g_motor_dshot_bit_cycles = 0U;
-static uint32_t g_motor_dshot_t0h_cycles = 0U;
-static uint32_t g_motor_dshot_t1h_cycles = 0U;
-static uint32_t g_motor_dshot_arm_prime_until_ms = 0U;
-static uint8_t g_motor_was_armed = 0U;
 static uint16_t g_motor_cmd_us[MOTOR_COUNT] = {
   MOTOR_PWM_MIN_US,
   MOTOR_PWM_MIN_US,
@@ -238,6 +240,16 @@ static uint8_t g_usb_cmd_frame_index = 0U;
 static uint8_t g_usb_cmd_frame_target = 0U;
 static char g_usb_cmd_line[32] = {0};
 static uint8_t g_usb_cmd_line_index = 0U;
+static volatile float g_display_filter_cutoff_hz = 40.0f;
+static int16_t g_display_filter_gx = 0;
+static int16_t g_display_filter_gy = 0;
+static int16_t g_display_filter_gz = 0;
+static uint16_t g_battery_voltage_mv = 0U;
+static uint8_t g_battery_adc_ready = 0U;
+static uint8_t g_battery_adc_channel_index = 10U;
+static uint8_t g_battery_adc_candidate_pos = 0U;
+static uint8_t g_battery_adc_zero_streak = 0U;
+static uint16_t g_battery_adc_raw_last = 0U;
 
 static void RC_SetFailsafeNeutral(void)
 {
@@ -257,8 +269,10 @@ static volatile uint32_t g_crsf_last_isr_byte_ms = 0U;
 #define TELEMETRY_PACKET_SOF2           0x5AU
 #define TELEMETRY_PACKET_TYPE_TELEMETRY  0x01U
 #define TELEMETRY_PACKET_TYPE_MOTOR_TEST 0x10U
-#define TELEMETRY_PACKET_PAYLOAD_BYTES   84U
+#define TELEMETRY_PACKET_TYPE_DISPLAY_FILTER 0x11U
+#define TELEMETRY_PACKET_PAYLOAD_BYTES_V6    98U
 #define MOTOR_TEST_PAYLOAD_BYTES         3U
+#define DISPLAY_FILTER_PAYLOAD_BYTES     2U
 #define MOTOR_TEST_TIMEOUT_MS            250U
 
 #define BMP280_I2C_TIMEOUT_MS           20U
@@ -278,6 +292,7 @@ void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
+static uint8_t MX_ADC1_Init(void);
 static void MX_UART5_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_UART4_Init(void);
@@ -285,6 +300,7 @@ static void MX_UART4_Init(void);
 static uint8_t MX_SPI4_Init(void);
 static void Telemetry_SendPacket(int32_t pitch_cd, int32_t roll_cd, int32_t yaw_cd,
                                  int16_t gx_raw, int16_t gy_raw, int16_t gz_raw,
+                                 int16_t gx_filtered, int16_t gy_filtered, int16_t gz_filtered,
                                  int16_t ax_raw, int16_t ay_raw, int16_t az_raw,
                                  uint32_t pressure_pa, int32_t altitude_cm);
 static uint8_t IMU_Probe(void);
@@ -307,6 +323,9 @@ static float IMU_WrapAngleDeg(float angle_deg);
 static float IMU_SanitizeAngleDeg(float angle_deg, float fallback_deg);
 static uint8_t BMP280_Init(void);
 static uint8_t BMP280_Update(void);
+static void Battery_Update(void);
+static void Battery_SelectAdcChannel(uint8_t channel_index);
+static uint32_t Battery_ReadChannelRaw(uint8_t channel_index, uint8_t *ok);
 static HAL_StatusTypeDef BMP280_ReadRegs(uint8_t reg, uint8_t *data, uint16_t len);
 static HAL_StatusTypeDef BMP280_WriteReg(uint8_t reg, uint8_t value);
 static float BMP280_PressureToAltitudeCm(float pressure_pa, float reference_pressure_pa);
@@ -324,18 +343,16 @@ static void MotorControl_UpdateVirtual(void);
 static void MotorControl_Disarm(void);
 static void MotorGui_ProcessUsbCommands(void);
 static void MotorGui_HandleMotorTest(uint8_t motor_index, uint16_t motor_us);
+static void MotorGui_HandleDisplayFilter(uint16_t cutoff_hz);
 static void MotorGui_ProcessAsciiByte(uint8_t byte);
 static void MotorGui_TryParseAsciiLine(const char *line);
 static uint8_t MX_TIM2_Init_MotorPwm(void);
 static void MotorOutput_InitAndStart(void);
+static void MotorOutput_BootHold(uint32_t duration_ms);
 static void MotorOutput_WriteMicroseconds(const uint16_t *motor_us);
 static float MotorControl_ClampF(float value, float min_value, float max_value);
 static float MotorControl_ChannelToBiPolar(uint16_t us);
 static float MotorControl_ChannelToThrottle(uint16_t us);
-static uint8_t MotorDshot_Init(void);
-static void MotorDshot_SendFromUs(const uint16_t *motor_us);
-static uint16_t MotorDshot_EncodeThrottle(uint16_t throttle_value);
-static uint16_t MotorDshot_UsToValue(uint16_t us);
 static uint8_t Packet_CalcXorChecksum(uint8_t packet_type, uint8_t payload_len, const uint8_t *payload);
 static uint16_t Parse_DecU16(const char *text, uint16_t *consumed);
 
@@ -425,6 +442,14 @@ static void MotorGui_HandleMotorTest(uint8_t motor_index, uint16_t motor_us)
   g_motor_gui_test_active = 1U;
 }
 
+static void MotorGui_HandleDisplayFilter(uint16_t cutoff_hz)
+{
+  float clamped_hz = MotorControl_ClampF((float)cutoff_hz, 5.0f, 150.0f);
+
+  g_display_filter_cutoff_hz = clamped_hz;
+  DisplayFilter_SetCutoffHz(clamped_hz);
+}
+
 static void MotorGui_TryParseAsciiLine(const char *line)
 {
   uint16_t consumed = 0U;
@@ -444,6 +469,14 @@ static void MotorGui_TryParseAsciiLine(const char *line)
   else if (strncmp(line, "MTEST,", 6U) == 0)
   {
     pos = 6U;
+  }
+  else if (strncmp(line, "DFLT ", 5U) == 0)
+  {
+    pos = 5U;
+  }
+  else if (strncmp(line, "DFLT,", 5U) == 0)
+  {
+    pos = 5U;
   }
   else
   {
@@ -470,6 +503,12 @@ static void MotorGui_TryParseAsciiLine(const char *line)
   us_u16 = Parse_DecU16(&line[pos], &consumed);
   if (consumed == 0U)
   {
+    return;
+  }
+
+  if ((line[0] == 'D') && (line[1] == 'F') && (line[2] == 'L') && (line[3] == 'T'))
+  {
+    MotorGui_HandleDisplayFilter(us_u16);
     return;
   }
 
@@ -587,6 +626,11 @@ static void MotorGui_ProcessUsbCommands(void)
           const uint16_t motor_us = (uint16_t)payload[1] | ((uint16_t)payload[2] << 8U);
           MotorGui_HandleMotorTest(motor_index, motor_us);
         }
+        else if ((packet_type == TELEMETRY_PACKET_TYPE_DISPLAY_FILTER) && (payload_len == DISPLAY_FILTER_PAYLOAD_BYTES))
+        {
+          const uint16_t cutoff_hz = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8U);
+          MotorGui_HandleDisplayFilter(cutoff_hz);
+        }
       }
 
       g_usb_cmd_frame_index = 0U;
@@ -595,164 +639,9 @@ static void MotorGui_ProcessUsbCommands(void)
   }
 }
 
-static uint16_t MotorDshot_UsToValue(uint16_t us)
-{
-  uint16_t clamped_us = us;
-  uint16_t value = 0U;
-
-  if (clamped_us <= MOTOR_PWM_MIN_US)
-  {
-    return 0U;
-  }
-  if (clamped_us > MOTOR_PWM_MAX_US)
-  {
-    clamped_us = MOTOR_PWM_MAX_US;
-  }
-
-  /* Map 1001..2000us to DShot throttle range 48..2047. */
-  value = (uint16_t)(48U + (((uint32_t)(clamped_us - (MOTOR_PWM_MIN_US + 1U)) * 1999U) / 999U));
-  if (value < MOTOR_DSHOT_MIN_ACTIVE_VALUE)
-  {
-    value = MOTOR_DSHOT_MIN_ACTIVE_VALUE;
-  }
-
-  return value;
-}
-
-static uint16_t MotorDshot_EncodeThrottle(uint16_t throttle_value)
-{
-  uint16_t packet = (uint16_t)((throttle_value & 0x07FFU) << 1U);
-  uint16_t csum_data = packet;
-  uint8_t csum = 0U;
-
-  /* 4-bit checksum over 3 nibbles. */
-  for (uint8_t i = 0U; i < 3U; i++)
-  {
-    csum ^= (uint8_t)(csum_data & 0x000FU);
-    csum_data >>= 4U;
-  }
-
-  return (uint16_t)((packet << 4U) | (csum & 0x0FU));
-}
-
-static uint8_t MotorDshot_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  const uint32_t hclk_hz = HAL_RCC_GetHCLKFreq();
-
-  if (hclk_hz == 0U)
-  {
-    return 0U;
-  }
-
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-
-  GPIO_InitStruct.Pin = MOTOR_DSHOT_GPIO_MASK;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-  HAL_GPIO_WritePin(GPIOB, MOTOR_DSHOT_GPIO_MASK, GPIO_PIN_RESET);
-
-  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-  DWT->CYCCNT = 0U;
-  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-
-  g_motor_dshot_bit_cycles = (hclk_hz + (MOTOR_DSHOT_BITRATE_HZ / 2U)) / MOTOR_DSHOT_BITRATE_HZ;
-  if (g_motor_dshot_bit_cycles < 16U)
-  {
-    return 0U;
-  }
-
-  g_motor_dshot_t0h_cycles = (g_motor_dshot_bit_cycles * 3U) / 8U;
-  g_motor_dshot_t1h_cycles = (g_motor_dshot_bit_cycles * 3U) / 4U;
-  if (g_motor_dshot_t0h_cycles < 1U)
-  {
-    g_motor_dshot_t0h_cycles = 1U;
-  }
-  if (g_motor_dshot_t1h_cycles <= g_motor_dshot_t0h_cycles)
-  {
-    g_motor_dshot_t1h_cycles = g_motor_dshot_t0h_cycles + 1U;
-  }
-
-  return 1U;
-}
-
-static void MotorDshot_SendFromUs(const uint16_t *motor_us)
-{
-  uint16_t frame[MOTOR_COUNT] = {0U, 0U, 0U, 0U};
-  const uint16_t pin_mask[MOTOR_COUNT] = {MOTOR1_GPIO_PIN, MOTOR2_GPIO_PIN, MOTOR3_GPIO_PIN, MOTOR4_GPIO_PIN};
-  uint16_t ones_mask_by_bit[16] = {0U};
-  uint16_t zero_mask_by_bit[16] = {0U};
-  uint32_t primask = 0U;
-
-  if ((motor_us == NULL) || (g_motor_dshot_ready == 0U))
-  {
-    return;
-  }
-
-  for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
-  {
-    const uint16_t value = MotorDshot_UsToValue(motor_us[i]);
-    frame[i] = MotorDshot_EncodeThrottle(value);
-  }
-
-  for (uint8_t bit = 0U; bit < 16U; bit++)
-  {
-    const uint16_t bit_mask = (uint16_t)(1U << (15U - bit));
-
-    for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
-    {
-      if ((frame[i] & bit_mask) != 0U)
-      {
-        ones_mask_by_bit[bit] |= pin_mask[i];
-      }
-      else
-      {
-        zero_mask_by_bit[bit] |= pin_mask[i];
-      }
-    }
-  }
-
-  primask = __get_PRIMASK();
-  __disable_irq();
-
-  for (uint8_t burst = 0U; burst < MOTOR_DSHOT_BURST_FRAMES; burst++)
-  {
-    for (uint8_t bit = 0U; bit < 16U; bit++)
-    {
-      const uint16_t ones_mask = ones_mask_by_bit[bit];
-      const uint16_t zero_mask = zero_mask_by_bit[bit];
-      uint32_t t_start = 0U;
-
-      GPIOB->BSRR = (uint32_t)MOTOR_DSHOT_GPIO_MASK;
-      t_start = DWT->CYCCNT;
-      while ((uint32_t)(DWT->CYCCNT - t_start) < g_motor_dshot_t0h_cycles) {}
-      GPIOB->BSRR = (uint32_t)zero_mask << 16U;
-      while ((uint32_t)(DWT->CYCCNT - t_start) < g_motor_dshot_t1h_cycles) {}
-      GPIOB->BSRR = (uint32_t)ones_mask << 16U;
-      while ((uint32_t)(DWT->CYCCNT - t_start) < g_motor_dshot_bit_cycles) {}
-    }
-
-    GPIOB->BSRR = (uint32_t)MOTOR_DSHOT_GPIO_MASK << 16U;
-    {
-      const uint32_t t_gap_start = DWT->CYCCNT;
-      const uint32_t gap_cycles = g_motor_dshot_bit_cycles * 2U;
-      while ((uint32_t)(DWT->CYCCNT - t_gap_start) < gap_cycles) {}
-    }
-  }
-
-  if (primask == 0U)
-  {
-    __enable_irq();
-  }
-}
-
 static void MotorControl_Disarm(void)
 {
   g_motors_armed = 0U;
-  g_motor_was_armed = 0U;
-  g_motor_dshot_arm_prime_until_ms = 0U;
   for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
   {
     g_motor_cmd_us[i] = MOTOR_PWM_MIN_US;
@@ -764,8 +653,8 @@ static void MotorControl_Disarm(void)
 static uint8_t MX_TIM2_Init_MotorPwm(void)
 {
 #if (MOTOR_HW_OUTPUT_ENABLE != 0U)
-#if (MOTOR_PROTOCOL_DSHOT300_TEST != 0U)
-  g_motor_dshot_ready = MotorDshot_Init();
+#if (MOTOR_BACKEND == MOTOR_BACKEND_DSHOT)
+  g_motor_dshot_ready = dshot_init();
   return g_motor_dshot_ready;
 #else
   GPIO_InitTypeDef GPIO_InitStruct = {0};
@@ -895,16 +784,35 @@ static void MotorOutput_InitAndStart(void)
   MotorOutput_WriteMicroseconds(g_motor_cmd_us);
 }
 
+static void MotorOutput_BootHold(uint32_t duration_ms)
+{
+  const uint32_t start_ms = HAL_GetTick();
+
+  while ((HAL_GetTick() - start_ms) < duration_ms)
+  {
+    MotorOutput_WriteMicroseconds(g_motor_cmd_us);
+    HAL_Delay(2);
+  }
+}
+
 static void MotorOutput_WriteMicroseconds(const uint16_t *motor_us)
 {
 #if (MOTOR_HW_OUTPUT_ENABLE != 0U)
-#if (MOTOR_PROTOCOL_DSHOT300_TEST != 0U)
+#if (MOTOR_BACKEND == MOTOR_BACKEND_DSHOT)
   if ((g_motor_hw_ready == 0U) || (motor_us == NULL))
   {
     return;
   }
 
-  MotorDshot_SendFromUs(motor_us);
+  /* M1-only DMA DShot bring-up on S1/PB0 (TIM3_CH3). */
+  {
+    uint16_t dshot_value = MotorDshot_UsToValue(motor_us[0]);
+    if ((g_motors_armed != 0U) && (dshot_value == 0U))
+    {
+      dshot_value = MOTOR_DSHOT_MIN_ACTIVE_VALUE;
+    }
+    dshot_write_motor(0U, dshot_value);
+  }
 #else
   uint16_t m1 = MOTOR_PWM_MIN_US;
   uint16_t m2 = MOTOR_PWM_MIN_US;
@@ -1026,12 +934,6 @@ static void MotorControl_UpdateVirtual(void)
     g_motors_armed = 1U;
   }
 
-  if ((g_motors_armed != 0U) && (g_motor_was_armed == 0U))
-  {
-    g_motor_was_armed = 1U;
-    g_motor_dshot_arm_prime_until_ms = now_ms + MOTOR_DSHOT_ARM_PRIME_MS;
-  }
-
   if (g_motors_armed == 0U)
   {
     g_motor_output_mode = MOTOR_OUTPUT_MODE_SIMULATION;
@@ -1112,15 +1014,6 @@ static void MotorControl_UpdateVirtual(void)
 #endif
 
     uint16_t throttle_us = (uint16_t)(MOTOR_PWM_MIN_US + (uint16_t)lroundf(throttle * 1000.0f));
-#if (MOTOR_PROTOCOL_DSHOT300_TEST != 0U)
-    if ((throttle_us > MOTOR_PWM_MIN_US) && (now_ms < g_motor_dshot_arm_prime_until_ms))
-    {
-      if (throttle_us < MOTOR_DSHOT_ARM_PRIME_US)
-      {
-        throttle_us = MOTOR_DSHOT_ARM_PRIME_US;
-      }
-    }
-#endif
     if (throttle_us > MOTOR_PWM_MIN_US)
     {
       if (throttle_us < MOTOR_SPIN_FLOOR_US)
@@ -1295,6 +1188,7 @@ int main(void)
   MX_GPIO_Init();
 #if (USB_ENUM_DIAGNOSTIC == 0U)
   MX_I2C1_Init();
+  g_battery_adc_ready = MX_ADC1_Init();
   MX_UART5_Init();
   MX_USART1_UART_Init();
   MX_UART4_Init();
@@ -1307,6 +1201,7 @@ int main(void)
   uint32_t next_imu_probe_ms = 0U;
   uint32_t next_baro_probe_ms = 0U;
   uint32_t next_baro_update_ms = 0U;
+  uint32_t next_battery_update_ms = 0U;
   uint32_t now_ms = 0U;
   uint32_t next_telemetry_ms = 0U;
 
@@ -1318,9 +1213,10 @@ int main(void)
   next_imu_probe_ms = HAL_GetTick() + 500U;
   next_baro_probe_ms = HAL_GetTick() + 1000U;
   next_baro_update_ms = HAL_GetTick();
+  next_battery_update_ms = HAL_GetTick();
   next_telemetry_ms = HAL_GetTick();
 
-  HAL_Delay(1000);
+  MotorOutput_BootHold(1000U);
 
   /* Keep USB telemetry alive even if CRSF UART RX cannot start. */
   if (HAL_UART_Receive_IT(&huart4, &g_uart4_rx_byte, 1U) != HAL_OK)
@@ -1328,7 +1224,7 @@ int main(void)
     g_rc_link_ok = 0U;
   }
 #else
-  HAL_Delay(1000);
+  MotorOutput_BootHold(1000U);
 #endif
   /* USER CODE END 2 */
 
@@ -1395,6 +1291,12 @@ int main(void)
       }
     }
 
+    if ((g_battery_adc_ready != 0U) && (HAL_GetTick() >= next_battery_update_ms))
+    {
+      Battery_Update();
+      next_battery_update_ms = HAL_GetTick() + 100U;
+    }
+
     if (g_imu_found)
     {
       uint8_t gyro_ok = IMU_ReadRaw(&gyro_x, &gyro_y, &gyro_z);
@@ -1419,6 +1321,9 @@ int main(void)
       accel_x = 0;
       accel_y = 0;
       accel_z = 0;
+      g_display_filter_gx = 0;
+      g_display_filter_gy = 0;
+      g_display_filter_gz = 0;
     }
 
     now_ms = HAL_GetTick();
@@ -1430,6 +1335,9 @@ int main(void)
                            gyro_x,
                            gyro_y,
                            gyro_z,
+                           g_display_filter_gx,
+                           g_display_filter_gy,
+                           g_display_filter_gz,
                            accel_x,
                            accel_y,
                            accel_z,
@@ -1738,6 +1646,227 @@ static void MX_I2C1_Init(void)
   }
 }
 
+static uint8_t MX_ADC1_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  uint32_t start_ms = HAL_GetTick();
+
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_ADC12_CLK_ENABLE();
+
+  GPIO_InitStruct.Pin = BATTERY_ADC_PIN | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(BATTERY_ADC_PORT, &GPIO_InitStruct);
+
+  /* Exit deep-power-down, enable regulator, and wait briefly. */
+  ADC1->CR &= ~ADC_CR_DEEPPWD;
+  ADC1->CR |= ADC_CR_ADVREGEN;
+  while ((HAL_GetTick() - start_ms) < 10U) {}
+
+  /* Ensure ADC is disabled before calibration/configuration. */
+  if ((ADC1->CR & ADC_CR_ADEN) != 0U)
+  {
+    ADC1->CR |= ADC_CR_ADDIS;
+    start_ms = HAL_GetTick();
+    while ((ADC1->CR & ADC_CR_ADEN) != 0U)
+    {
+      if ((HAL_GetTick() - start_ms) > 10U)
+      {
+        break;
+      }
+    }
+  }
+
+  /* Single-ended calibration. */
+  ADC1->CR &= ~ADC_CR_ADCALDIF;
+  ADC1->CR |= ADC_CR_ADCAL;
+  start_ms = HAL_GetTick();
+  while ((ADC1->CR & ADC_CR_ADCAL) != 0U)
+  {
+    if ((HAL_GetTick() - start_ms) > 100U)
+    {
+      break;
+    }
+  }
+
+  /* Select channel, sample time, and one conversion in regular sequence. */
+  ADC12_COMMON->CCR = 0U;
+  ADC12_COMMON->CCR |= (1UL << ADC_CCR_CKMODE_Pos); /* HCLK/2 kernel clock */
+
+  ADC1->CFGR = 0U;
+  ADC1->CFGR |= ADC_CFGR_RES_1; /* 12-bit resolution */
+  ADC1->CFGR &= ~ADC_CFGR_EXTEN; /* Software trigger */
+  ADC1->CFGR &= ~ADC_CFGR_CONT;  /* Single conversion */
+  Battery_SelectAdcChannel(g_battery_adc_channel_index);
+
+  for (uint8_t attempt = 0U; attempt < 3U; attempt++)
+  {
+    ADC1->ISR = ADC_ISR_ADRDY;
+    ADC1->CR |= ADC_CR_ADEN;
+    start_ms = HAL_GetTick();
+    while ((ADC1->ISR & ADC_ISR_ADRDY) == 0U)
+    {
+      if ((HAL_GetTick() - start_ms) > 100U)
+      {
+        break;
+      }
+    }
+
+    if ((ADC1->ISR & ADC_ISR_ADRDY) != 0U)
+    {
+      return 1U;
+    }
+
+    ADC1->CR |= ADC_CR_ADDIS;
+    start_ms = HAL_GetTick();
+    while ((ADC1->CR & ADC_CR_ADEN) != 0U)
+    {
+      if ((HAL_GetTick() - start_ms) > 20U)
+      {
+        break;
+      }
+    }
+  }
+
+  return 0U;
+}
+
+static void Battery_SelectAdcChannel(uint8_t channel_index)
+{
+  uint32_t smpr_pos = 0U;
+  uint32_t smpr_mask = 0U;
+
+  if (channel_index > 18U)
+  {
+    channel_index = 10U;
+  }
+
+  g_battery_adc_channel_index = channel_index;
+
+  ADC1->PCSEL = (1UL << channel_index);
+
+  if (channel_index <= 9U)
+  {
+    smpr_pos = ((uint32_t)channel_index) * 3U;
+    smpr_mask = (0x7UL << smpr_pos);
+    ADC1->SMPR1 = (ADC1->SMPR1 & (~smpr_mask)) | (0x7UL << smpr_pos);
+  }
+  else
+  {
+    smpr_pos = ((uint32_t)channel_index - 10U) * 3U;
+    smpr_mask = (0x7UL << smpr_pos);
+    ADC1->SMPR2 = (ADC1->SMPR2 & (~smpr_mask)) | (0x7UL << smpr_pos);
+  }
+
+  ADC1->SQR1 = 0U;
+  ADC1->SQR1 |= ((uint32_t)channel_index << ADC_SQR1_SQ1_Pos);
+}
+
+static void Battery_Update(void)
+{
+  uint32_t raw = 0U;
+  uint32_t max_raw = 0U;
+  uint8_t max_channel = g_battery_adc_channel_index;
+  uint8_t convert_ok = 0U;
+  uint32_t pin_mv = 0U;
+  uint32_t battery_mv = 0U;
+  static const uint8_t battery_channel_candidates[] = {10U, 11U, 8U, 12U, 13U};
+  const uint8_t battery_channel_count = (uint8_t)(sizeof(battery_channel_candidates) / sizeof(battery_channel_candidates[0]));
+
+  if (g_battery_adc_ready == 0U)
+  {
+    g_battery_adc_raw_last = 0U;
+    g_battery_voltage_mv = 0U;
+    return;
+  }
+
+  for (uint8_t i = 0U; i < battery_channel_count; i++)
+  {
+    uint8_t candidate_ok = 0U;
+    uint8_t candidate_channel = battery_channel_candidates[i];
+    uint32_t candidate_raw = Battery_ReadChannelRaw(candidate_channel, &candidate_ok);
+    if (candidate_ok != 0U)
+    {
+      convert_ok = 1U;
+      if (candidate_raw >= max_raw)
+      {
+        max_raw = candidate_raw;
+        max_channel = candidate_channel;
+      }
+    }
+  }
+
+  if (convert_ok == 0U)
+  {
+    g_battery_adc_raw_last = 0U;
+    g_battery_voltage_mv = 0U;
+    return;
+  }
+
+  raw = max_raw;
+  g_battery_adc_channel_index = max_channel;
+  g_battery_adc_raw_last = (uint16_t)raw;
+
+  if (raw <= 2U)
+  {
+    if (g_battery_adc_zero_streak < 255U)
+    {
+      g_battery_adc_zero_streak++;
+    }
+
+    if (g_battery_adc_zero_streak >= 20U)
+    {
+      g_battery_adc_zero_streak = 0U;
+      g_battery_adc_candidate_pos = (uint8_t)((g_battery_adc_candidate_pos + 1U) % battery_channel_count);
+      Battery_SelectAdcChannel(battery_channel_candidates[g_battery_adc_candidate_pos]);
+    }
+  }
+  else
+  {
+    g_battery_adc_zero_streak = 0U;
+  }
+
+  pin_mv = (raw * BATTERY_VREF_MV) / BATTERY_ADC_MAX_COUNTS;
+  battery_mv = (pin_mv * BATTERY_DIVIDER_NUM) / BATTERY_DIVIDER_DEN;
+  g_battery_voltage_mv = (uint16_t)battery_mv;
+}
+
+static uint32_t Battery_ReadChannelRaw(uint8_t channel_index, uint8_t *ok)
+{
+  uint32_t raw = 0U;
+  uint32_t start_ms = HAL_GetTick();
+
+  if (ok != NULL)
+  {
+    *ok = 0U;
+  }
+
+  Battery_SelectAdcChannel(channel_index);
+  ADC1->ISR = ADC_ISR_EOC | ADC_ISR_EOS | ADC_ISR_EOSMP | ADC_ISR_OVR;
+  ADC1->CR |= ADC_CR_ADSTART;
+
+  while ((ADC1->ISR & ADC_ISR_EOC) == 0U)
+  {
+    if ((HAL_GetTick() - start_ms) > 5U)
+    {
+      return 0U;
+    }
+  }
+
+  raw = ADC1->DR;
+  if (raw > BATTERY_ADC_MAX_COUNTS)
+  {
+    raw = BATTERY_ADC_MAX_COUNTS;
+  }
+
+  if (ok != NULL)
+  {
+    *ok = 1U;
+  }
+  return raw;
+}
+
 /**
   * @brief UART4 Initialization Function
   * @param None
@@ -1987,17 +2116,18 @@ static void Packet_PutS32LE(uint8_t *dst, int32_t value)
 
 static void Telemetry_SendPacket(int32_t pitch_cd, int32_t roll_cd, int32_t yaw_cd,
                                  int16_t gx_raw, int16_t gy_raw, int16_t gz_raw,
+                                 int16_t gx_filtered, int16_t gy_filtered, int16_t gz_filtered,
                                  int16_t ax_raw, int16_t ay_raw, int16_t az_raw,
                                  uint32_t pressure_pa, int32_t altitude_cm)
 {
-  uint8_t frame[4U + TELEMETRY_PACKET_PAYLOAD_BYTES + 1U];
+  uint8_t frame[4U + TELEMETRY_PACKET_PAYLOAD_BYTES_V6 + 1U];
   uint8_t checksum = 0U;
   uint8_t payload_index = 0U;
 
   frame[0] = TELEMETRY_PACKET_SOF1;
   frame[1] = TELEMETRY_PACKET_SOF2;
   frame[2] = TELEMETRY_PACKET_TYPE_TELEMETRY;
-  frame[3] = TELEMETRY_PACKET_PAYLOAD_BYTES;
+  frame[3] = TELEMETRY_PACKET_PAYLOAD_BYTES_V6;
 
   Packet_PutU32LE(&frame[4U + payload_index], g_telemetry_sequence++);
   payload_index = (uint8_t)(payload_index + 4U);
@@ -2014,6 +2144,12 @@ static void Telemetry_SendPacket(int32_t pitch_cd, int32_t roll_cd, int32_t yaw_
   Packet_PutS16LE(&frame[4U + payload_index], gy_raw);
   payload_index = (uint8_t)(payload_index + 2U);
   Packet_PutS16LE(&frame[4U + payload_index], gz_raw);
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutS16LE(&frame[4U + payload_index], gx_filtered);
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutS16LE(&frame[4U + payload_index], gy_filtered);
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutS16LE(&frame[4U + payload_index], gz_filtered);
   payload_index = (uint8_t)(payload_index + 2U);
   Packet_PutS16LE(&frame[4U + payload_index], ax_raw);
   payload_index = (uint8_t)(payload_index + 2U);
@@ -2033,6 +2169,9 @@ static void Telemetry_SendPacket(int32_t pitch_cd, int32_t roll_cd, int32_t yaw_
 
   Packet_PutS32LE(&frame[4U + payload_index], altitude_cm);
   payload_index = (uint8_t)(payload_index + 4U);
+
+  Packet_PutU16LE(&frame[4U + payload_index], g_battery_voltage_mv);
+  payload_index = (uint8_t)(payload_index + 2U);
 
   Packet_PutU16LE(&frame[4U + payload_index], g_rc_channels_us[0]);
   payload_index = (uint8_t)(payload_index + 2U);
@@ -2060,12 +2199,22 @@ static void Telemetry_SendPacket(int32_t pitch_cd, int32_t roll_cd, int32_t yaw_
     payload_index = (uint8_t)(payload_index + 2U);
   }
 
-  for (uint32_t i = 2U; i < (4U + TELEMETRY_PACKET_PAYLOAD_BYTES); i++)
+  Packet_PutU16LE(&frame[4U + payload_index], (uint16_t)MotorControl_ClampF(g_display_filter_cutoff_hz, 5.0f, 150.0f));
+  payload_index = (uint8_t)(payload_index + 2U);
+
+  Packet_PutU16LE(&frame[4U + payload_index], g_battery_adc_raw_last);
+  payload_index = (uint8_t)(payload_index + 2U);
+  frame[4U + payload_index] = g_battery_adc_channel_index;
+  payload_index = (uint8_t)(payload_index + 1U);
+  frame[4U + payload_index] = g_battery_adc_ready;
+  payload_index = (uint8_t)(payload_index + 1U);
+
+  for (uint32_t i = 2U; i < (4U + TELEMETRY_PACKET_PAYLOAD_BYTES_V6); i++)
   {
     checksum ^= frame[i];
   }
 
-  frame[4U + TELEMETRY_PACKET_PAYLOAD_BYTES] = checksum;
+  frame[4U + TELEMETRY_PACKET_PAYLOAD_BYTES_V6] = checksum;
 
   Serial_Write(frame, (uint16_t)sizeof(frame));
 }
@@ -2538,6 +2687,8 @@ static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax
     }
   }
   s_last_update_ms = now_ms;
+
+  DisplayFilter_ProcessGyro(dt, gx, gy, gz, &g_display_filter_gx, &g_display_filter_gy, &g_display_filter_gz);
 
   /* Apply gyro bias correction */
   int16_t gx_corrected = gx - (int16_t)g_gyro_bias_x;
