@@ -2,13 +2,13 @@
 
 #include <stddef.h>
 
-#define DISPLAY_FILTER_MIN_CUTOFF_HZ  5.0f
-#define DISPLAY_FILTER_MAX_CUTOFF_HZ  150.0f
+#define DISPLAY_FILTER_MIN_CUTOFF_HZ  0.0f
+#define DISPLAY_FILTER_MAX_CUTOFF_HZ  10.0f
 #define DISPLAY_FILTER_TWO_PI         6.2831853071795864769f
 #define DISPLAY_FILTER_EPSILON        0.000001f
 
-static float s_cutoff_hz = 40.0f;
-static float s_rc_seconds = 1.0f / (DISPLAY_FILTER_TWO_PI * 40.0f);
+static float s_cutoff_hz = 5.0f;
+static float s_rc_seconds = 1.0f / (DISPLAY_FILTER_TWO_PI * 5.0f);
 static float s_state_gx = 0.0f;
 static float s_state_gy = 0.0f;
 static float s_state_gz = 0.0f;
@@ -53,7 +53,14 @@ static int16_t display_filter_round_to_i16(float value)
 static void display_filter_recompute_coefficients(float cutoff_hz)
 {
   s_cutoff_hz = display_filter_clamp(cutoff_hz, DISPLAY_FILTER_MIN_CUTOFF_HZ, DISPLAY_FILTER_MAX_CUTOFF_HZ);
-  s_rc_seconds = 1.0f / (DISPLAY_FILTER_TWO_PI * s_cutoff_hz);
+  if (s_cutoff_hz <= DISPLAY_FILTER_EPSILON)
+  {
+    s_rc_seconds = 0.0f;
+  }
+  else
+  {
+    s_rc_seconds = 1.0f / (DISPLAY_FILTER_TWO_PI * s_cutoff_hz);
+  }
 }
 
 void DisplayFilter_Init(float cutoff_hz)
@@ -96,6 +103,18 @@ void DisplayFilter_ProcessGyro(float dt_seconds,
   if (dt_seconds < DISPLAY_FILTER_EPSILON)
   {
     dt_seconds = DISPLAY_FILTER_EPSILON;
+  }
+
+  if (s_cutoff_hz <= DISPLAY_FILTER_EPSILON)
+  {
+    s_state_gx = raw_x;
+    s_state_gy = raw_y;
+    s_state_gz = raw_z;
+    s_initialized = 1U;
+    *filtered_gx = raw_gx;
+    *filtered_gy = raw_gy;
+    *filtered_gz = raw_gz;
+    return;
   }
 
   alpha = dt_seconds / (s_rc_seconds + dt_seconds);

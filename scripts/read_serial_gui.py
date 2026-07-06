@@ -16,6 +16,7 @@ import importlib.util
 import json
 import math
 import os
+import socket
 import struct
 import threading
 import time
@@ -38,6 +39,11 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise SystemExit("pyserial is required. Install it with: pip install pyserial") from exc
 
+try:
+    import tm_protocol
+except Exception:  # pragma: no cover
+    tm_protocol = None
+
 imufusion = None
 imufusion_error = ""
 try:
@@ -59,15 +65,22 @@ TELEMETRY_PAYLOAD_LEN_V3 = 84
 TELEMETRY_PAYLOAD_LEN_V4 = 92
 TELEMETRY_PAYLOAD_LEN_V5 = 94
 TELEMETRY_PAYLOAD_LEN_V6 = 98
+TELEMETRY_PAYLOAD_LEN_V7 = 104
+TELEMETRY_PAYLOAD_LEN_V8 = 116
+TELEMETRY_PAYLOAD_LEN_V9 = 122
 TELEMETRY_STRUCT_V1 = struct.Struct("<Iiii6hBIIi16H")
 TELEMETRY_STRUCT_V2 = struct.Struct("<Iiii6hBIIi16HBB4H")
 TELEMETRY_STRUCT_V3 = struct.Struct("<Iiii6hBIIi16HBBB4H")
 TELEMETRY_STRUCT_V4 = struct.Struct("<Iiii9hBIIi16HBBB5H")
 TELEMETRY_STRUCT_V5 = struct.Struct("<Iiii9hBIIiH16HBBB5H")
 TELEMETRY_STRUCT_V6 = struct.Struct("<Iiii9hBIIiH16HBBB5HHBB")
+TELEMETRY_STRUCT_V7 = struct.Struct("<Iiii9hBIIiH16HBBB5HHBBhhh")
+TELEMETRY_STRUCT_V8 = struct.Struct("<Iiii9hBIIiH16HBBB5HHBBhhhhhhhhh")
+TELEMETRY_STRUCT_V9 = struct.Struct("<Iiii9hBIIiH16HBBB5HHBBhhhhhhhhhhhh")
 IMU_ACCEL_LSB_PER_G = 2048.0
 IMU_GYRO_DPS_PER_LSB = 2000.0 / 32768.0
 LAYOUT_SCHEMA_VERSION = 2
+TM_COMBINED_FAST_STRUCT = struct.Struct("<hhhhhhHHHHHHHHHHBBIIIII")
 
 
 def _checksum(packet_type: int, payload: bytes) -> int:
@@ -96,6 +109,30 @@ def _pick_port() -> str | None:
             fallback = port.device
 
     return fallback
+
+
+def _parse_tcp_endpoint(port_spec: str) -> tuple[str, int] | None:
+    text = (port_spec or "").strip()
+    if not text or text.lower() == "auto":
+        return None
+
+    if text.upper().startswith("COM"):
+        return None
+
+    if ":" not in text:
+        return None
+
+    host, port_text = text.rsplit(":", 1)
+    host = host.strip()
+    port_text = port_text.strip()
+    if not host or not port_text.isdigit():
+        return None
+
+    port = int(port_text)
+    if port < 1 or port > 65535:
+        return None
+
+    return host, port
 
 
 def _decode_frames(buffer: bytearray) -> Iterable[tuple[int, ...]]:
@@ -154,6 +191,18 @@ def _decode_frames(buffer: bytearray) -> Iterable[tuple[int, ...]]:
             yield TELEMETRY_STRUCT_V6.unpack(payload)
             continue
 
+        if payload_len == TELEMETRY_PAYLOAD_LEN_V7:
+            yield TELEMETRY_STRUCT_V7.unpack(payload)
+            continue
+
+        if payload_len == TELEMETRY_PAYLOAD_LEN_V8:
+            yield TELEMETRY_STRUCT_V8.unpack(payload)
+            continue
+
+        if payload_len == TELEMETRY_PAYLOAD_LEN_V9:
+            yield TELEMETRY_STRUCT_V9.unpack(payload)
+            continue
+
 
 def _build_motor_test_packet(motor_index: int, motor_us: int) -> bytes:
     payload = bytes(
@@ -177,7 +226,7 @@ def _build_motor_test_ascii(motor_index: int, motor_us: int) -> bytes:
 
 
 def _build_display_filter_packet(cutoff_hz: int) -> bytes:
-    cutoff = max(5, min(150, int(cutoff_hz)))
+    cutoff = max(0, min(10, int(cutoff_hz)))
     payload = bytes((cutoff & 0xFF, (cutoff >> 8) & 0xFF))
     packet_type = PACKET_TYPE_DISPLAY_FILTER
     frame = bytearray((SOF1, SOF2, packet_type, len(payload)))
@@ -187,7 +236,7 @@ def _build_display_filter_packet(cutoff_hz: int) -> bytes:
 
 
 def _build_display_filter_ascii(cutoff_hz: int) -> bytes:
-    cutoff = max(5, min(150, int(cutoff_hz)))
+    cutoff = max(0, min(10, int(cutoff_hz)))
     return f"DFLT {cutoff}\n".encode("ascii")
 
 
@@ -206,7 +255,7 @@ class TelemetryState:
     ax: int = 0
     ay: int = 0
     az: int = 0
-    display_filter_cutoff_hz: int = 40
+    display_filter_cutoff_hz: int = 5
     pressure_pa: int = 0
     altitude_cm: int = 0
     battery_mv: int | None = None
@@ -214,6 +263,18 @@ class TelemetryState:
     battery_adc_raw: int = 0
     battery_adc_channel: int = 255
     battery_adc_ready: int = 0
+    desired_roll_rate_dps: float = 0.0
+    desired_pitch_rate_dps: float = 0.0
+    desired_yaw_rate_dps: float = 0.0
+    gyro_roll_rate_dps: float = 0.0
+    gyro_pitch_rate_dps: float = 0.0
+    gyro_yaw_rate_dps: float = 0.0
+    roll_rate_error_dps: float = 0.0
+    pitch_rate_error_dps: float = 0.0
+    yaw_rate_error_dps: float = 0.0
+    roll_pid_output: float = 0.0
+    pitch_pid_output: float = 0.0
+    yaw_pid_output: float = 0.0
     rc_link_ok: bool = False
     rc_frames: int = 0
     channels: list[int] = field(default_factory=lambda: [0] * 16)
@@ -233,6 +294,7 @@ class SerialReader(threading.Thread):
         super().__init__(daemon=True)
         self.port = port
         self.baud = baud
+        self.tcp_endpoint = _parse_tcp_endpoint(port)
         self.state = state
         self.lock = lock
         self.running = True
@@ -249,7 +311,7 @@ class SerialReader(threading.Thread):
         with self._tx_lock:
             self._tx_queue.append(frame)
 
-    def _drain_tx(self, ser: serial.Serial) -> None:
+    def _drain_tx_serial(self, ser: serial.Serial) -> None:
         pending: list[bytes]
         with self._tx_lock:
             pending = self._tx_queue
@@ -262,19 +324,516 @@ class SerialReader(threading.Thread):
                 self.error_message = "Failed to send command frame"
                 return
 
+    def _drain_tx_socket(self, sock: socket.socket) -> None:
+        pending: list[bytes]
+        with self._tx_lock:
+            pending = self._tx_queue
+            self._tx_queue = []
+
+        for frame in pending:
+            try:
+                sock.sendall(frame)
+            except Exception:
+                self.error_message = "Failed to send command frame"
+                return
+
+    def _apply_decoded(self, candidate: str, values: tuple[int, ...]) -> None:
+        if len(values) == 57:
+            (
+                sequence,
+                pitch_cd,
+                roll_cd,
+                yaw_cd,
+                gx,
+                gy,
+                gz,
+                gx_filtered,
+                gy_filtered,
+                gz_filtered,
+                ax,
+                ay,
+                az,
+                rc_link,
+                rc_frames,
+                pressure_pa,
+                altitude_cm,
+                battery_mv,
+                *channels,
+            ) = values
+            display_filter_cutoff_hz = int(channels[23])
+            battery_adc_raw = int(channels[24])
+            battery_adc_channel = int(channels[25])
+            battery_adc_ready = int(channels[26])
+            desired_roll_rate_dps = int(channels[27]) * 0.1
+            desired_pitch_rate_dps = int(channels[28]) * 0.1
+            desired_yaw_rate_dps = int(channels[29]) * 0.1
+            gyro_roll_rate_dps = int(channels[30]) * 0.1
+            gyro_pitch_rate_dps = int(channels[31]) * 0.1
+            gyro_yaw_rate_dps = int(channels[32]) * 0.1
+            roll_rate_error_dps = int(channels[33]) * 0.1
+            pitch_rate_error_dps = int(channels[34]) * 0.1
+            yaw_rate_error_dps = int(channels[35]) * 0.1
+            roll_pid_output = int(channels[36]) * 0.0001
+            pitch_pid_output = int(channels[37]) * 0.0001
+            yaw_pid_output = int(channels[38]) * 0.0001
+            battery_mv = int(battery_mv)
+            battery_voltage_v = float(battery_mv) * 0.001
+            gyro_filter_available = True
+        elif len(values) == 54:
+            (
+                sequence,
+                pitch_cd,
+                roll_cd,
+                yaw_cd,
+                gx,
+                gy,
+                gz,
+                gx_filtered,
+                gy_filtered,
+                gz_filtered,
+                ax,
+                ay,
+                az,
+                rc_link,
+                rc_frames,
+                pressure_pa,
+                altitude_cm,
+                battery_mv,
+                *channels,
+            ) = values
+            display_filter_cutoff_hz = int(channels[23])
+            battery_adc_raw = int(channels[24])
+            battery_adc_channel = int(channels[25])
+            battery_adc_ready = int(channels[26])
+            desired_roll_rate_dps = int(channels[27]) * 0.1
+            desired_pitch_rate_dps = int(channels[28]) * 0.1
+            desired_yaw_rate_dps = int(channels[29]) * 0.1
+            gyro_roll_rate_dps = int(channels[30]) * 0.1
+            gyro_pitch_rate_dps = int(channels[31]) * 0.1
+            gyro_yaw_rate_dps = int(channels[32]) * 0.1
+            roll_rate_error_dps = int(channels[33]) * 0.1
+            pitch_rate_error_dps = int(channels[34]) * 0.1
+            yaw_rate_error_dps = int(channels[35]) * 0.1
+            roll_pid_output = 0.0
+            pitch_pid_output = 0.0
+            yaw_pid_output = 0.0
+            battery_mv = int(battery_mv)
+            battery_voltage_v = float(battery_mv) * 0.001
+            gyro_filter_available = True
+        elif len(values) == 48:
+            (
+                sequence,
+                pitch_cd,
+                roll_cd,
+                yaw_cd,
+                gx,
+                gy,
+                gz,
+                gx_filtered,
+                gy_filtered,
+                gz_filtered,
+                ax,
+                ay,
+                az,
+                rc_link,
+                rc_frames,
+                pressure_pa,
+                altitude_cm,
+                battery_mv,
+                *channels,
+            ) = values
+            display_filter_cutoff_hz = int(channels[23])
+            battery_adc_raw = int(channels[24])
+            battery_adc_channel = int(channels[25])
+            battery_adc_ready = int(channels[26])
+            desired_roll_rate_dps = int(channels[27]) * 0.1
+            desired_pitch_rate_dps = int(channels[28]) * 0.1
+            desired_yaw_rate_dps = int(channels[29]) * 0.1
+            gyro_roll_rate_dps = 0.0
+            gyro_pitch_rate_dps = 0.0
+            gyro_yaw_rate_dps = 0.0
+            roll_rate_error_dps = 0.0
+            pitch_rate_error_dps = 0.0
+            yaw_rate_error_dps = 0.0
+            roll_pid_output = 0.0
+            pitch_pid_output = 0.0
+            yaw_pid_output = 0.0
+            battery_mv = int(battery_mv)
+            battery_voltage_v = float(battery_mv) * 0.001
+            gyro_filter_available = True
+        elif len(values) == 45:
+            (
+                sequence,
+                pitch_cd,
+                roll_cd,
+                yaw_cd,
+                gx,
+                gy,
+                gz,
+                gx_filtered,
+                gy_filtered,
+                gz_filtered,
+                ax,
+                ay,
+                az,
+                rc_link,
+                rc_frames,
+                pressure_pa,
+                altitude_cm,
+                battery_mv,
+                *channels,
+            ) = values
+            display_filter_cutoff_hz = int(channels[23])
+            battery_adc_raw = int(channels[24])
+            battery_adc_channel = int(channels[25])
+            battery_adc_ready = int(channels[26])
+            desired_roll_rate_dps = 0.0
+            desired_pitch_rate_dps = 0.0
+            desired_yaw_rate_dps = 0.0
+            gyro_roll_rate_dps = 0.0
+            gyro_pitch_rate_dps = 0.0
+            gyro_yaw_rate_dps = 0.0
+            roll_rate_error_dps = 0.0
+            pitch_rate_error_dps = 0.0
+            yaw_rate_error_dps = 0.0
+            roll_pid_output = 0.0
+            pitch_pid_output = 0.0
+            yaw_pid_output = 0.0
+            battery_mv = int(battery_mv)
+            battery_voltage_v = float(battery_mv) * 0.001
+            gyro_filter_available = True
+        elif len(values) == 42:
+            (
+                sequence,
+                pitch_cd,
+                roll_cd,
+                yaw_cd,
+                gx,
+                gy,
+                gz,
+                gx_filtered,
+                gy_filtered,
+                gz_filtered,
+                ax,
+                ay,
+                az,
+                rc_link,
+                rc_frames,
+                pressure_pa,
+                altitude_cm,
+                battery_mv,
+                *channels,
+            ) = values
+            display_filter_cutoff_hz = int(channels[23])
+            battery_adc_raw = 0
+            battery_adc_channel = 255
+            battery_adc_ready = 0
+            desired_roll_rate_dps = 0.0
+            desired_pitch_rate_dps = 0.0
+            desired_yaw_rate_dps = 0.0
+            battery_mv = int(battery_mv)
+            battery_voltage_v = float(battery_mv) * 0.001
+            gyro_filter_available = True
+            gyro_roll_rate_dps = 0.0
+            gyro_pitch_rate_dps = 0.0
+            gyro_yaw_rate_dps = 0.0
+            roll_rate_error_dps = 0.0
+            pitch_rate_error_dps = 0.0
+            yaw_rate_error_dps = 0.0
+            roll_pid_output = 0.0
+            pitch_pid_output = 0.0
+            yaw_pid_output = 0.0
+        elif len(values) == 41:
+            (
+                sequence,
+                pitch_cd,
+                roll_cd,
+                yaw_cd,
+                gx,
+                gy,
+                gz,
+                gx_filtered,
+                gy_filtered,
+                gz_filtered,
+                ax,
+                ay,
+                az,
+                rc_link,
+                rc_frames,
+                pressure_pa,
+                altitude_cm,
+                *channels,
+            ) = values
+            display_filter_cutoff_hz = int(channels[23])
+            battery_adc_raw = 0
+            battery_adc_channel = 255
+            battery_adc_ready = 0
+            desired_roll_rate_dps = 0.0
+            desired_pitch_rate_dps = 0.0
+            desired_yaw_rate_dps = 0.0
+            gyro_roll_rate_dps = 0.0
+            gyro_pitch_rate_dps = 0.0
+            gyro_yaw_rate_dps = 0.0
+            roll_rate_error_dps = 0.0
+            pitch_rate_error_dps = 0.0
+            yaw_rate_error_dps = 0.0
+            roll_pid_output = 0.0
+            pitch_pid_output = 0.0
+            yaw_pid_output = 0.0
+            battery_mv = None
+            battery_voltage_v = None
+            gyro_filter_available = True
+        else:
+            (
+                sequence,
+                pitch_cd,
+                roll_cd,
+                yaw_cd,
+                gx,
+                gy,
+                gz,
+                ax,
+                ay,
+                az,
+                rc_link,
+                rc_frames,
+                pressure_pa,
+                altitude_cm,
+                *channels,
+            ) = values
+            gx_filtered = gx
+            gy_filtered = gy
+            gz_filtered = gz
+            display_filter_cutoff_hz = 5
+            battery_adc_raw = 0
+            battery_adc_channel = 255
+            battery_adc_ready = 0
+            desired_roll_rate_dps = 0.0
+            desired_pitch_rate_dps = 0.0
+            desired_yaw_rate_dps = 0.0
+            gyro_roll_rate_dps = 0.0
+            gyro_pitch_rate_dps = 0.0
+            gyro_yaw_rate_dps = 0.0
+            roll_rate_error_dps = 0.0
+            pitch_rate_error_dps = 0.0
+            yaw_rate_error_dps = 0.0
+            roll_pid_output = 0.0
+            pitch_pid_output = 0.0
+            yaw_pid_output = 0.0
+            battery_mv = None
+            battery_voltage_v = None
+            gyro_filter_available = False
+
+        motor_mode = int(channels[16])
+        motors_armed = int(channels[17])
+        gui_test_active = int(channels[18])
+        motors_us = [int(v) for v in channels[19:23]]
+        channels = channels[:16]
+
+        with self.lock:
+            self.state.sequence = int(sequence)
+            self.state.pitch_deg = int(pitch_cd) / 100.0
+            self.state.roll_deg = int(roll_cd) / 100.0
+            self.state.yaw_deg = int(yaw_cd) / 100.0
+            self.state.gx = int(gx)
+            self.state.gy = int(gy)
+            self.state.gz = int(gz)
+            self.state.gx_filtered = int(gx_filtered)
+            self.state.gy_filtered = int(gy_filtered)
+            self.state.gz_filtered = int(gz_filtered)
+            self.state.ax = int(ax)
+            self.state.ay = int(ay)
+            self.state.az = int(az)
+            self.state.display_filter_cutoff_hz = int(display_filter_cutoff_hz)
+            self.state.pressure_pa = int(pressure_pa)
+            self.state.altitude_cm = int(altitude_cm)
+            self.state.battery_mv = battery_mv
+            self.state.battery_voltage_v = battery_voltage_v
+            self.state.battery_adc_raw = int(battery_adc_raw)
+            self.state.battery_adc_channel = int(battery_adc_channel)
+            self.state.battery_adc_ready = int(battery_adc_ready)
+            self.state.desired_roll_rate_dps = float(desired_roll_rate_dps)
+            self.state.desired_pitch_rate_dps = float(desired_pitch_rate_dps)
+            self.state.desired_yaw_rate_dps = float(desired_yaw_rate_dps)
+            self.state.gyro_roll_rate_dps = float(gyro_roll_rate_dps)
+            self.state.gyro_pitch_rate_dps = float(gyro_pitch_rate_dps)
+            self.state.gyro_yaw_rate_dps = float(gyro_yaw_rate_dps)
+            self.state.roll_rate_error_dps = float(roll_rate_error_dps)
+            self.state.pitch_rate_error_dps = float(pitch_rate_error_dps)
+            self.state.yaw_rate_error_dps = float(yaw_rate_error_dps)
+            self.state.roll_pid_output = float(roll_pid_output)
+            self.state.pitch_pid_output = float(pitch_pid_output)
+            self.state.yaw_pid_output = float(yaw_pid_output)
+            self.state.rc_link_ok = bool(rc_link)
+            self.state.rc_frames = int(rc_frames)
+            self.state.channels = [int(v) for v in channels]
+            self.state.motor_mode = motor_mode
+            self.state.motors_armed = motors_armed
+            self.state.gui_test_active = gui_test_active
+            self.state.gyro_filter_available = bool(gyro_filter_available)
+            self.state.motors_us = motors_us
+            self.state.last_update_monotonic = time.monotonic()
+            self.state.connected = True
+            self.state.status_text = f"Connected: {candidate}"
+
+    def _apply_tm_combined_fast(self, candidate: str, sequence: int, payload: bytes) -> None:
+        if len(payload) != TM_COMBINED_FAST_STRUCT.size:
+            return
+
+        (
+            gyro_x_dps10,
+            gyro_y_dps10,
+            gyro_z_dps10,
+            roll_cd,
+            pitch_cd,
+            yaw_cd,
+            rc_throttle_us,
+            rc_roll_us,
+            rc_pitch_us,
+            rc_yaw_us,
+            rc_arm_us,
+            motor1_us,
+            motor2_us,
+            motor3_us,
+            motor4_us,
+            _loop_dt_us,
+            armed,
+            failsafe_flags,
+            telemetry_packet_counter,
+            _command_packet_counter,
+            _dropped_packet_counter,
+            _crc_error_counter,
+            _unknown_command_counter,
+        ) = TM_COMBINED_FAST_STRUCT.unpack(payload)
+
+        channels = [1500] * 16
+        channels[0] = int(rc_roll_us)
+        channels[1] = int(rc_pitch_us)
+        channels[2] = int(rc_throttle_us)
+        channels[3] = int(rc_yaw_us)
+        channels[4] = int(rc_arm_us)
+
+        with self.lock:
+            self.state.sequence = int(sequence)
+            self.state.pitch_deg = float(pitch_cd) / 100.0
+            self.state.roll_deg = float(roll_cd) / 100.0
+            self.state.yaw_deg = float(yaw_cd) / 100.0
+            self.state.gx = int(gyro_x_dps10)
+            self.state.gy = int(gyro_y_dps10)
+            self.state.gz = int(gyro_z_dps10)
+            self.state.gx_filtered = int(gyro_x_dps10)
+            self.state.gy_filtered = int(gyro_y_dps10)
+            self.state.gz_filtered = int(gyro_z_dps10)
+            self.state.ax = 0
+            self.state.ay = 0
+            self.state.az = 0
+            self.state.display_filter_cutoff_hz = 5
+            self.state.pressure_pa = 0
+            self.state.altitude_cm = 0
+            self.state.battery_mv = None
+            self.state.battery_voltage_v = None
+            self.state.battery_adc_raw = 0
+            self.state.battery_adc_channel = 255
+            self.state.battery_adc_ready = 0
+            self.state.desired_roll_rate_dps = 0.0
+            self.state.desired_pitch_rate_dps = 0.0
+            self.state.desired_yaw_rate_dps = 0.0
+            self.state.gyro_roll_rate_dps = float(gyro_x_dps10) * 0.1
+            self.state.gyro_pitch_rate_dps = float(gyro_y_dps10) * 0.1
+            self.state.gyro_yaw_rate_dps = float(gyro_z_dps10) * 0.1
+            self.state.roll_rate_error_dps = 0.0
+            self.state.pitch_rate_error_dps = 0.0
+            self.state.yaw_rate_error_dps = 0.0
+            self.state.roll_pid_output = 0.0
+            self.state.pitch_pid_output = 0.0
+            self.state.yaw_pid_output = 0.0
+            self.state.rc_link_ok = bool((failsafe_flags & 0x01) == 0)
+            self.state.rc_frames = int(telemetry_packet_counter)
+            self.state.channels = channels
+            self.state.motor_mode = 1
+            self.state.motors_armed = int(armed)
+            self.state.gui_test_active = 0
+            self.state.gyro_filter_available = True
+            self.state.motors_us = [int(motor1_us), int(motor2_us), int(motor3_us), int(motor4_us)]
+            self.state.last_update_monotonic = time.monotonic()
+            self.state.connected = True
+            self.state.status_text = f"Connected: {candidate}"
+
     def _candidate_ports(self) -> list[str]:
-        if self.port.lower() != "auto":
-            return [self.port]
+        if self.tcp_endpoint is not None:
+            host, tcp_port = self.tcp_endpoint
+            return [f"{host}:{tcp_port}"]
 
         ports: list[str] = []
+        seen: set[str] = set()
+
+        if self.port.lower() != "auto":
+            ports.append(self.port)
+            seen.add(self.port.upper())
+
         for p in list_ports.comports():
             if "STLink" in p.description or "ST-LINK" in p.description:
                 continue
+            key = p.device.upper()
+            if key in seen:
+                continue
             ports.append(p.device)
+            seen.add(key)
         return ports
 
     def run(self) -> None:
         while self.running:
+            if self.tcp_endpoint is not None:
+                host, tcp_port = self.tcp_endpoint
+                candidate = f"{host}:{tcp_port}"
+                try:
+                    with socket.create_connection((host, tcp_port), timeout=2.0) as sock:
+                        sock.settimeout(0.2)
+                        tm_parser = tm_protocol.StreamParser() if tm_protocol is not None else None
+                        with self.lock:
+                            self.state.connected = True
+                            self.state.port_name = candidate
+                            self.state.status_text = f"Connected: {candidate}"
+
+                        buffer = bytearray()
+                        last_packet_time = time.monotonic()
+                        while self.running:
+                            self._drain_tx_socket(sock)
+                            try:
+                                chunk = sock.recv(4096)
+                            except TimeoutError:
+                                chunk = b""
+                            except OSError:
+                                break
+
+                            if not chunk:
+                                idle_s = time.monotonic() - last_packet_time
+                                if idle_s > 2.0:
+                                    with self.lock:
+                                        self.state.connected = True
+                                        self.state.status_text = (
+                                            f"Connected: {candidate} (telemetry idle {idle_s:0.1f}s)"
+                                        )
+                                continue
+
+                            if tm_parser is not None:
+                                for frame in tm_parser.feed(chunk):
+                                    if frame.packet_type == int(tm_protocol.PacketType.TM_COMBINED_FAST):
+                                        self._apply_tm_combined_fast(candidate, frame.sequence, frame.payload)
+                                        last_packet_time = time.monotonic()
+                            else:
+                                buffer.extend(chunk)
+                                for values in _decode_frames(buffer):
+                                    self._apply_decoded(candidate, values)
+                                    last_packet_time = time.monotonic()
+                except OSError as exc:
+                    self.error_message = str(exc)
+                    with self.lock:
+                        self.state.connected = False
+                        self.state.status_text = f"Socket lost: {candidate} (retrying...)"
+                    time.sleep(0.3)
+                continue
+
             candidates = self._candidate_ports()
             if not candidates:
                 with self.lock:
@@ -298,172 +857,21 @@ class SerialReader(threading.Thread):
                         buffer = bytearray()
                         last_packet_time = time.monotonic()
                         while self.running:
-                            self._drain_tx(ser)
+                            self._drain_tx_serial(ser)
                             chunk = ser.read(ser.in_waiting or 1)
                             if not chunk:
-                                # If stream goes idle for too long, force reopen so reconnect/sniff can recover.
-                                if (time.monotonic() - last_packet_time) > 2.0:
+                                # Keep port open across short telemetry gaps; only mark DN on real serial errors.
+                                idle_s = time.monotonic() - last_packet_time
+                                if idle_s > 2.0:
                                     with self.lock:
-                                        self.state.connected = False
-                                        self.state.status_text = f"No data on {candidate}, reopening..."
-                                    break
+                                        self.state.connected = True
+                                        self.state.status_text = (
+                                            f"Connected: {candidate} (telemetry idle {idle_s:0.1f}s)"
+                                        )
                                 continue
                             buffer.extend(chunk)
                             for values in _decode_frames(buffer):
-                                if len(values) == 45:
-                                    (
-                                        sequence,
-                                        pitch_cd,
-                                        roll_cd,
-                                        yaw_cd,
-                                        gx,
-                                        gy,
-                                        gz,
-                                        gx_filtered,
-                                        gy_filtered,
-                                        gz_filtered,
-                                        ax,
-                                        ay,
-                                        az,
-                                        rc_link,
-                                        rc_frames,
-                                        pressure_pa,
-                                        altitude_cm,
-                                        battery_mv,
-                                        *channels,
-                                    ) = values
-                                    display_filter_cutoff_hz = int(channels[23])
-                                    battery_adc_raw = int(channels[24])
-                                    battery_adc_channel = int(channels[25])
-                                    battery_adc_ready = int(channels[26])
-                                    battery_mv = int(battery_mv)
-                                    battery_voltage_v = float(battery_mv) * 0.001
-                                    gyro_filter_available = True
-                                elif len(values) == 42:
-                                    (
-                                        sequence,
-                                        pitch_cd,
-                                        roll_cd,
-                                        yaw_cd,
-                                        gx,
-                                        gy,
-                                        gz,
-                                        gx_filtered,
-                                        gy_filtered,
-                                        gz_filtered,
-                                        ax,
-                                        ay,
-                                        az,
-                                        rc_link,
-                                        rc_frames,
-                                        pressure_pa,
-                                        altitude_cm,
-                                        battery_mv,
-                                        *channels,
-                                    ) = values
-                                    display_filter_cutoff_hz = int(channels[23])
-                                    battery_adc_raw = 0
-                                    battery_adc_channel = 255
-                                    battery_adc_ready = 0
-                                    battery_mv = int(battery_mv)
-                                    battery_voltage_v = float(battery_mv) * 0.001
-                                    gyro_filter_available = True
-                                elif len(values) == 41:
-                                    (
-                                        sequence,
-                                        pitch_cd,
-                                        roll_cd,
-                                        yaw_cd,
-                                        gx,
-                                        gy,
-                                        gz,
-                                        gx_filtered,
-                                        gy_filtered,
-                                        gz_filtered,
-                                        ax,
-                                        ay,
-                                        az,
-                                        rc_link,
-                                        rc_frames,
-                                        pressure_pa,
-                                        altitude_cm,
-                                        *channels,
-                                    ) = values
-                                    display_filter_cutoff_hz = int(channels[23])
-                                    battery_adc_raw = 0
-                                    battery_adc_channel = 255
-                                    battery_adc_ready = 0
-                                    battery_mv = None
-                                    battery_voltage_v = None
-                                    gyro_filter_available = True
-                                else:
-                                    (
-                                        sequence,
-                                        pitch_cd,
-                                        roll_cd,
-                                        yaw_cd,
-                                        gx,
-                                        gy,
-                                        gz,
-                                        ax,
-                                        ay,
-                                        az,
-                                        rc_link,
-                                        rc_frames,
-                                        pressure_pa,
-                                        altitude_cm,
-                                        *channels,
-                                    ) = values
-                                    gx_filtered = gx
-                                    gy_filtered = gy
-                                    gz_filtered = gz
-                                    display_filter_cutoff_hz = 40
-                                    battery_adc_raw = 0
-                                    battery_adc_channel = 255
-                                    battery_adc_ready = 0
-                                    battery_mv = None
-                                    battery_voltage_v = None
-                                    gyro_filter_available = False
-
-                                motor_mode = int(channels[16])
-                                motors_armed = int(channels[17])
-                                gui_test_active = int(channels[18])
-                                motors_us = [int(v) for v in channels[19:23]]
-                                channels = channels[:16]
-
-                                with self.lock:
-                                    self.state.sequence = int(sequence)
-                                    self.state.pitch_deg = int(pitch_cd) / 100.0
-                                    self.state.roll_deg = int(roll_cd) / 100.0
-                                    self.state.yaw_deg = int(yaw_cd) / 100.0
-                                    self.state.gx = int(gx)
-                                    self.state.gy = int(gy)
-                                    self.state.gz = int(gz)
-                                    self.state.gx_filtered = int(gx_filtered)
-                                    self.state.gy_filtered = int(gy_filtered)
-                                    self.state.gz_filtered = int(gz_filtered)
-                                    self.state.ax = int(ax)
-                                    self.state.ay = int(ay)
-                                    self.state.az = int(az)
-                                    self.state.display_filter_cutoff_hz = int(display_filter_cutoff_hz)
-                                    self.state.pressure_pa = int(pressure_pa)
-                                    self.state.altitude_cm = int(altitude_cm)
-                                    self.state.battery_mv = battery_mv
-                                    self.state.battery_voltage_v = battery_voltage_v
-                                    self.state.battery_adc_raw = int(battery_adc_raw)
-                                    self.state.battery_adc_channel = int(battery_adc_channel)
-                                    self.state.battery_adc_ready = int(battery_adc_ready)
-                                    self.state.rc_link_ok = bool(rc_link)
-                                    self.state.rc_frames = int(rc_frames)
-                                    self.state.channels = [int(v) for v in channels]
-                                    self.state.motor_mode = motor_mode
-                                    self.state.motors_armed = motors_armed
-                                    self.state.gui_test_active = gui_test_active
-                                    self.state.gyro_filter_available = bool(gyro_filter_available)
-                                    self.state.motors_us = motors_us
-                                    self.state.last_update_monotonic = time.monotonic()
-                                    self.state.connected = True
-                                    self.state.status_text = f"Connected: {candidate}"
+                                self._apply_decoded(candidate, values)
                                 last_packet_time = time.monotonic()
                 except serial.SerialException as exc:
                     self.error_message = str(exc)
@@ -505,8 +913,10 @@ class TelemetryApp:
         self.imu_var = tk.StringVar(value="")
         self.baro_var = tk.StringVar(value="")
         self.battery_var = tk.StringVar(value="BAT n/a")
-        self.filter_target_var = tk.StringVar(value="Requested cutoff: 40 Hz")
-        self.filter_fw_var = tk.StringVar(value="Firmware cutoff: 40 Hz")
+        self.filter_target_var = tk.StringVar(value="Requested cutoff: 5 Hz")
+        self.filter_fw_var = tk.StringVar(value="Firmware cutoff: 5 Hz")
+        self._filter_command_after_id: str | None = None
+        self._last_filter_sent = 5
 
         header = ttk.Frame(root, padding=10)
         header.pack(fill=tk.X)
@@ -556,16 +966,19 @@ class TelemetryApp:
 
         self.filter_scale = ttk.Scale(
             filter_card,
-            from_=5,
-            to=150,
+            from_=0,
+            to=10,
             orient=tk.HORIZONTAL,
             command=self._on_filter_cutoff_changed,
         )
-        self.filter_scale.set(40)
+        self.filter_scale.set(5)
         self.filter_scale.pack(fill=tk.X, padx=2, pady=(0, 6))
 
         self.gyro_canvas = tk.Canvas(filter_card, height=220, bg="#0f1720", highlightthickness=0)
         self.gyro_canvas.pack(fill=tk.BOTH, expand=True)
+
+        self.fft_canvas = tk.Canvas(filter_card, height=170, bg="#0b1320", highlightthickness=0)
+        self.fft_canvas.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
         root_stack.add(filter_card, weight=2)
 
         bottom_row = ttk.Panedwindow(root_stack, orient=tk.HORIZONTAL)
@@ -640,8 +1053,9 @@ class TelemetryApp:
         self._fusion_ready = False
         self._gyro_raw_history = deque(maxlen=240)
         self._gyro_filtered_history = deque(maxlen=240)
+        self._gyro_time_history = deque(maxlen=240)
         self._filter_command_after_id: str | None = None
-        self._last_filter_sent = 40
+        self._last_filter_sent = 5
         if imufusion is not None:
             if hasattr(imufusion, "Bias") and hasattr(imufusion, "BiasSettings"):
                 self._fusion_bias = imufusion.Bias()
@@ -752,7 +1166,7 @@ class TelemetryApp:
         self.reader.queue_command(_build_display_filter_ascii(cutoff_hz))
 
     def _send_display_filter_now(self, cutoff_hz: int) -> None:
-        cutoff = max(5, min(150, int(cutoff_hz)))
+        cutoff = max(0, min(10, int(cutoff_hz)))
         self._last_filter_sent = cutoff
         self.filter_target_var.set(f"Requested cutoff: {cutoff} Hz")
         self._queue_display_filter(cutoff)
@@ -760,14 +1174,15 @@ class TelemetryApp:
     def _on_filter_cutoff_changed(self, value: str) -> None:
         cutoff = int(float(value))
         self.filter_target_var.set(f"Requested cutoff: {cutoff} Hz")
-        if self._filter_command_after_id is not None:
+        if getattr(self, "_filter_command_after_id", None) is not None:
             self.root.after_cancel(self._filter_command_after_id)
         self._filter_command_after_id = self.root.after(35, lambda cutoff=cutoff: self._send_display_filter_now(cutoff))
 
     def _on_test_us_changed(self, value: str) -> None:
         us = int(float(value))
         self.test_us_var.set(us)
-        self.test_us_label.configure(text=f"{us:4d} us")
+        if hasattr(self, "test_us_label"):
+            self.test_us_label.configure(text=f"{us:4d} us")
         if self.test_running:
             self._queue_motor_test(self.test_motor_var.get(), us)
 
@@ -1037,6 +1452,26 @@ class TelemetryApp:
 
         self._gyro_raw_history.append(raw_sample)
         self._gyro_filtered_history.append(filtered_sample)
+        if snapshot.last_update_monotonic > 0.0:
+            self._gyro_time_history.append(float(snapshot.last_update_monotonic))
+        else:
+            self._gyro_time_history.append(time.monotonic())
+
+    def _estimate_gyro_sample_rate_hz(self) -> float:
+        if len(self._gyro_time_history) < 4:
+            return 30.0
+
+        times = list(self._gyro_time_history)
+        diffs = [times[i] - times[i - 1] for i in range(1, len(times))]
+        diffs = [d for d in diffs if 0.001 <= d <= 0.2]
+        if not diffs:
+            return 30.0
+
+        diffs.sort()
+        dt = diffs[len(diffs) // 2]
+        if dt <= 0.0:
+            return 30.0
+        return max(5.0, min(2000.0, 1.0 / dt))
 
     def _draw_gyro_graph(self, snapshot: TelemetryState) -> None:
         c = self.gyro_canvas
@@ -1093,6 +1528,99 @@ class TelemetryApp:
 
         draw_plot(0, split, self._gyro_raw_history, "Raw Gyro (dps)")
         draw_plot(split, h, self._gyro_filtered_history, "Filtered Gyro (dps)")
+
+    def _draw_fft_graph(self, snapshot: TelemetryState) -> None:
+        c = self.fft_canvas
+        c.delete("all")
+        w = c.winfo_width()
+        h = c.winfo_height()
+        c.create_rectangle(0, 0, w, h, fill="#0b1320", outline="")
+
+        left = 48
+        right = w - 14
+        top = 24
+        bottom = h - 18
+        c.create_text(10, 6, anchor="nw", fill="#e5e7eb", font=("Consolas", 10, "bold"), text="FFT Raw vs Filtered")
+
+        n_available = min(len(self._gyro_raw_history), len(self._gyro_filtered_history))
+        if n_available < 32:
+            c.create_text(w / 2, h / 2, fill="#94a3b8", font=("Consolas", 10), text="Need more samples for FFT")
+            return
+
+        fs_hz = self._estimate_gyro_sample_rate_hz()
+        n = min(256, n_available)
+        raw_mag = [math.sqrt(x * x + y * y + z * z) for (x, y, z) in list(self._gyro_raw_history)[-n:]]
+        filt_mag = [math.sqrt(x * x + y * y + z * z) for (x, y, z) in list(self._gyro_filtered_history)[-n:]]
+
+        if np is None:
+            c.create_text(w / 2, h / 2, fill="#94a3b8", font=("Consolas", 10), text="Install numpy for FFT view")
+            return
+
+        raw_arr = np.array(raw_mag, dtype=float)
+        filt_arr = np.array(filt_mag, dtype=float)
+        raw_arr = raw_arr - np.mean(raw_arr)
+        filt_arr = filt_arr - np.mean(filt_arr)
+
+        window = np.hanning(n)
+        raw_spec = np.abs(np.fft.rfft(raw_arr * window))
+        filt_spec = np.abs(np.fft.rfft(filt_arr * window))
+        freqs = np.fft.rfftfreq(n, d=(1.0 / fs_hz))
+
+        nyquist = fs_hz * 0.5
+        max_freq = min(150.0, nyquist)
+        if max_freq <= 1.0:
+            c.create_text(w / 2, h / 2, fill="#94a3b8", font=("Consolas", 10), text="Sample rate too low for FFT")
+            return
+
+        mask = (freqs >= 1.0) & (freqs <= max_freq)
+        if not np.any(mask):
+            c.create_text(w / 2, h / 2, fill="#94a3b8", font=("Consolas", 10), text="FFT band empty")
+            return
+
+        band_freq = freqs[mask]
+        band_raw = raw_spec[mask]
+        band_filt = filt_spec[mask]
+
+        y_max = float(max(np.max(band_raw), np.max(band_filt), 1e-6))
+        c.create_line(left, bottom, right, bottom, fill="#334155")
+        c.create_line(left, top, left, bottom, fill="#334155")
+        c.create_text(left, top - 2, anchor="sw", fill="#94a3b8", font=("Consolas", 9), text=f"0..{max_freq:4.1f} Hz  fs {fs_hz:5.1f}")
+
+        grid_steps = 4
+        for i in range(1, grid_steps + 1):
+            frac = i / grid_steps
+            gy = bottom - (bottom - top) * frac
+            c.create_line(left, gy, right, gy, fill="#142033")
+
+        def to_points(freq_vec, amp_vec):
+            pts: list[float] = []
+            span_x = max_freq - 1.0
+            span_y = max(1e-6, y_max)
+            for f, a in zip(freq_vec, amp_vec):
+                x = left + ((float(f) - 1.0) / span_x) * (right - left)
+                y = bottom - (float(a) / span_y) * (bottom - top)
+                pts.extend((x, y))
+            return pts
+
+        raw_points = to_points(band_freq, band_raw)
+        filt_points = to_points(band_freq, band_filt)
+        if len(raw_points) >= 4:
+            c.create_line(*raw_points, fill="#ef4444", width=2)
+        if len(filt_points) >= 4:
+            c.create_line(*filt_points, fill="#22d3ee", width=2)
+
+        raw_peak_idx = int(np.argmax(band_raw))
+        filt_peak_idx = int(np.argmax(band_filt))
+        raw_peak_hz = float(band_freq[raw_peak_idx])
+        filt_peak_hz = float(band_freq[filt_peak_idx])
+        c.create_text(right - 220, top + 8, anchor="nw", fill="#fecaca", font=("Consolas", 9), text=f"Raw peak {raw_peak_hz:5.1f} Hz")
+        c.create_text(right - 220, top + 24, anchor="nw", fill="#a5f3fc", font=("Consolas", 9), text=f"Filt peak {filt_peak_hz:5.1f} Hz")
+        c.create_text(right - 220, top + 40, anchor="nw", fill="#cbd5e1", font=("Consolas", 9), text=f"Cutoff {snapshot.display_filter_cutoff_hz:3d} Hz")
+
+        c.create_line(right - 88, top + 10, right - 72, top + 10, fill="#ef4444", width=3)
+        c.create_text(right - 68, top + 10, anchor="w", fill="#fecaca", font=("Consolas", 9), text="Raw")
+        c.create_line(right - 88, top + 26, right - 72, top + 26, fill="#22d3ee", width=3)
+        c.create_text(right - 68, top + 26, anchor="w", fill="#a5f3fc", font=("Consolas", 9), text="Filt")
 
     def _draw_board_3d(self, pitch: float, roll: float, yaw: float, quaternion=None) -> None:
         c = self.board3d_canvas
@@ -1387,6 +1915,18 @@ class TelemetryApp:
                 battery_adc_raw=self.state.battery_adc_raw,
                 battery_adc_channel=self.state.battery_adc_channel,
                 battery_adc_ready=self.state.battery_adc_ready,
+                desired_roll_rate_dps=self.state.desired_roll_rate_dps,
+                desired_pitch_rate_dps=self.state.desired_pitch_rate_dps,
+                desired_yaw_rate_dps=self.state.desired_yaw_rate_dps,
+                gyro_roll_rate_dps=self.state.gyro_roll_rate_dps,
+                gyro_pitch_rate_dps=self.state.gyro_pitch_rate_dps,
+                gyro_yaw_rate_dps=self.state.gyro_yaw_rate_dps,
+                roll_rate_error_dps=self.state.roll_rate_error_dps,
+                pitch_rate_error_dps=self.state.pitch_rate_error_dps,
+                yaw_rate_error_dps=self.state.yaw_rate_error_dps,
+                roll_pid_output=self.state.roll_pid_output,
+                pitch_pid_output=self.state.pitch_pid_output,
+                yaw_pid_output=self.state.yaw_pid_output,
                 rc_link_ok=self.state.rc_link_ok,
                 rc_frames=self.state.rc_frames,
                 channels=list(self.state.channels),
@@ -1433,7 +1973,19 @@ class TelemetryApp:
             f"{snapshot.status_text} | {fusion_label} | Motor us: "
             f"M1 {snapshot.motors_us[0]:4d} M2 {snapshot.motors_us[1]:4d} "
             f"M3 {snapshot.motors_us[2]:4d} M4 {snapshot.motors_us[3]:4d} "
-            f"| GUI test: {'ON' if snapshot.gui_test_active else 'OFF'}"
+            f"| GUI test: {'ON' if snapshot.gui_test_active else 'OFF'} "
+            f"| Desired rate dps R {snapshot.desired_roll_rate_dps:+6.1f} "
+            f"P {snapshot.desired_pitch_rate_dps:+6.1f} "
+            f"Y {snapshot.desired_yaw_rate_dps:+6.1f} "
+            f"| Gyro dps R {snapshot.gyro_roll_rate_dps:+6.1f} "
+            f"P {snapshot.gyro_pitch_rate_dps:+6.1f} "
+            f"Y {snapshot.gyro_yaw_rate_dps:+6.1f} "
+            f"| Err dps R {snapshot.roll_rate_error_dps:+6.1f} "
+            f"P {snapshot.pitch_rate_error_dps:+6.1f} "
+            f"Y {snapshot.yaw_rate_error_dps:+6.1f} "
+            f"| PID R {snapshot.roll_pid_output:+0.3f} "
+            f"P {snapshot.pitch_pid_output:+0.3f} "
+            f"Y {snapshot.yaw_pid_output:+0.3f}"
         )
 
         # Keep startup attitude aligned with firmware's calibrated level estimate.
@@ -1452,6 +2004,7 @@ class TelemetryApp:
         self._draw_sticks(snapshot.channels)
         self._draw_board_3d(source_pitch, source_roll, source_yaw, fusion_quaternion)
         self._draw_gyro_graph(snapshot)
+        self._draw_fft_graph(snapshot)
         self._draw_channels(snapshot.channels)
         self._draw_motors(snapshot.motor_mode, snapshot.motors_armed, snapshot.motors_us)
 
@@ -1459,9 +2012,10 @@ class TelemetryApp:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Graphical telemetry viewer for serial telemetry")
-    parser.add_argument("--port", default="COM6", help="Serial port, for example COM6 or auto")
+    parser = argparse.ArgumentParser(description="Graphical telemetry viewer for serial or TCP telemetry")
+    parser.add_argument("--port", default="COM6", help="Serial COM port (e.g. COM6/auto) or TCP host:port")
     parser.add_argument("--baud", type=int, default=115200, help="Baud rate")
+    parser.add_argument("--verbose", action="store_true", help="Print serial diagnostics to console")
     args = parser.parse_args()
 
     if args.port.lower() == "auto":
@@ -1469,12 +2023,13 @@ def main() -> int:
 
     if not args.port:
         ports = list(_list_ports())
-        if not ports:
-            print("No serial ports found.")
-        else:
-            print("Available serial ports:")
-            for p in ports:
-                print(f"  {p}")
+        if args.verbose:
+            if not ports:
+                print("No serial ports found.")
+            else:
+                print("Available serial ports:")
+                for p in ports:
+                    print(f"  {p}")
         return 1
 
     state = TelemetryState()
@@ -1495,7 +2050,8 @@ def main() -> int:
     root.mainloop()
 
     if reader.error_message:
-        print(f"Serial error on {args.port}: {reader.error_message}")
+        if args.verbose:
+            print(f"Serial error on {args.port}: {reader.error_message}")
         return 1
     return 0
 

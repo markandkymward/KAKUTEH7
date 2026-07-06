@@ -29,7 +29,12 @@ set(MX_Application_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../USB_DEVICE/App/usbd_desc.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../USB_DEVICE/App/usbd_cdc_if.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/main.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/tm_protocol.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/telemetry.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/command_rx.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/telemetry_link.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/display_filter.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/rate_controller.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/dshot.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32h7xx_it.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32h7xx_hal_msp.c

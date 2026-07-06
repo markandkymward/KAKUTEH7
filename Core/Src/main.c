@@ -25,9 +25,12 @@
 
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
 #include "usbd_cdc_if.h"
 #include "Fusion.h"
 #include "display_filter.h"
+#include "rate_controller.h"
+#include "telemetry_link.h"
 
 /* USER CODE END Includes */
 
@@ -93,6 +96,7 @@
 #define MOTOR_COUNT                     4U
 #define MOTOR_PWM_MIN_US                1000U
 #define MOTOR_PWM_MAX_US                2000U
+#define MOTOR_COMMAND_MIN_US            1100U
 #define MOTOR_ARM_SWITCH_US             1600U
 #define MOTOR_THROTTLE_MIN_US           1000U
 #define MOTOR_THROTTLE_MAX_US           2000U
@@ -121,6 +125,12 @@
 #define MOTOR_DSHOT_MIN_ACTIVE_VALUE    48U
 /* Diagnostic: also drive legacy PA0-PA3 TIM2 outputs while using INAV S1-S4 map. */
 #define MOTOR_OUTPUT_DUAL_MAP_DIAG      0U
+#define RATE_CMD_DEADBAND               0.05f
+#define RATE_CMD_ROLL_MAX_DPS           120.0f
+#define RATE_CMD_PITCH_MAX_DPS          120.0f
+#define RATE_CMD_YAW_MAX_DPS            90.0f
+#define RATE_CMD_ROLL_SIGN              (-1.0f)
+#define RATE_CMD_PITCH_SIGN             (-1.0f)
 
 #define MOTOR1_GPIO_PIN                 GPIO_PIN_0   /* S1: TIM3_CH3, M1 aft-right */
 #define MOTOR2_GPIO_PIN                 GPIO_PIN_1   /* S2: TIM3_CH4, M2 forward-right */
@@ -138,7 +148,7 @@
 /* Private variables ---------------------------------------------------------*/
 
 UART_HandleTypeDef huart4;
-UART_HandleTypeDef huart5;
+UART_HandleTypeDef huart6;
 UART_HandleTypeDef huart1;
 I2C_HandleTypeDef hi2c1;
 TIM_HandleTypeDef htim2;
@@ -175,6 +185,9 @@ static float g_q0 = 1.0f;
 static float g_q1 = 0.0f;
 static float g_q2 = 0.0f;
 static float g_q3 = 0.0f;
+static float g_gyro_roll_rate_dps = 0.0f;
+static float g_gyro_pitch_rate_dps = 0.0f;
+static float g_gyro_yaw_rate_dps = 0.0f;
 static FusionAhrs g_fusion_ahrs;
 static uint8_t g_fusion_ready = 0U;
 
@@ -233,14 +246,14 @@ static uint16_t g_motor_cmd_us[MOTOR_COUNT] = {
 };
 static uint8_t g_motor_gui_test_active = 0U;
 static uint8_t g_motor_gui_test_index = 0U;
-static uint16_t g_motor_gui_test_us = MOTOR_PWM_MIN_US;
+static uint16_t g_motor_gui_test_us = MOTOR_COMMAND_MIN_US;
 static uint32_t g_motor_gui_test_expire_ms = 0U;
 static uint8_t g_usb_cmd_frame[16] = {0U};
 static uint8_t g_usb_cmd_frame_index = 0U;
 static uint8_t g_usb_cmd_frame_target = 0U;
 static char g_usb_cmd_line[32] = {0};
 static uint8_t g_usb_cmd_line_index = 0U;
-static volatile float g_display_filter_cutoff_hz = 40.0f;
+static volatile float g_display_filter_cutoff_hz = 5.0f;
 static int16_t g_display_filter_gx = 0;
 static int16_t g_display_filter_gy = 0;
 static int16_t g_display_filter_gz = 0;
@@ -250,6 +263,16 @@ static uint8_t g_battery_adc_channel_index = 10U;
 static uint8_t g_battery_adc_candidate_pos = 0U;
 static uint8_t g_battery_adc_zero_streak = 0U;
 static uint16_t g_battery_adc_raw_last = 0U;
+static float g_desired_roll_rate_dps = 0.0f;
+static float g_desired_pitch_rate_dps = 0.0f;
+static float g_desired_yaw_rate_dps = 0.0f;
+static float g_roll_rate_error_dps = 0.0f;
+static float g_pitch_rate_error_dps = 0.0f;
+static float g_yaw_rate_error_dps = 0.0f;
+static float g_roll_pid_output = 0.0f;
+static float g_pitch_pid_output = 0.0f;
+static float g_yaw_pid_output = 0.0f;
+static RateController g_rate_controller;
 
 static void RC_SetFailsafeNeutral(void)
 {
@@ -270,7 +293,7 @@ static volatile uint32_t g_crsf_last_isr_byte_ms = 0U;
 #define TELEMETRY_PACKET_TYPE_TELEMETRY  0x01U
 #define TELEMETRY_PACKET_TYPE_MOTOR_TEST 0x10U
 #define TELEMETRY_PACKET_TYPE_DISPLAY_FILTER 0x11U
-#define TELEMETRY_PACKET_PAYLOAD_BYTES_V6    98U
+#define TELEMETRY_PACKET_PAYLOAD_BYTES_V8    122U
 #define MOTOR_TEST_PAYLOAD_BYTES         3U
 #define DISPLAY_FILTER_PAYLOAD_BYTES     2U
 #define MOTOR_TEST_TIMEOUT_MS            250U
@@ -293,7 +316,7 @@ static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static uint8_t MX_ADC1_Init(void);
-static void MX_UART5_Init(void);
+static void MX_USART6_UART_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_UART4_Init(void);
 /* USER CODE BEGIN PFP */
@@ -351,6 +374,7 @@ static void MotorOutput_InitAndStart(void);
 static void MotorOutput_BootHold(uint32_t duration_ms);
 static void MotorOutput_WriteMicroseconds(const uint16_t *motor_us);
 static float MotorControl_ClampF(float value, float min_value, float max_value);
+static float MotorControl_ApplyDeadband(float value, float deadband);
 static float MotorControl_ChannelToBiPolar(uint16_t us);
 static float MotorControl_ChannelToThrottle(uint16_t us);
 static uint8_t Packet_CalcXorChecksum(uint8_t packet_type, uint8_t payload_len, const uint8_t *payload);
@@ -372,6 +396,28 @@ static float MotorControl_ClampF(float value, float min_value, float max_value)
     return max_value;
   }
   return value;
+}
+
+static float MotorControl_ApplyDeadband(float value, float deadband)
+{
+  float magnitude = value;
+
+  if (magnitude < 0.0f)
+  {
+    magnitude = -magnitude;
+  }
+
+  if (magnitude <= deadband)
+  {
+    return 0.0f;
+  }
+
+  if (value > 0.0f)
+  {
+    return (value - deadband) / (1.0f - deadband);
+  }
+
+  return (value + deadband) / (1.0f - deadband);
 }
 
 static float MotorControl_ChannelToBiPolar(uint16_t us)
@@ -431,20 +477,20 @@ static void MotorGui_HandleMotorTest(uint8_t motor_index, uint16_t motor_us)
   if ((motor_index < 1U) || (motor_index > MOTOR_COUNT))
   {
     g_motor_gui_test_active = 0U;
-    g_motor_gui_test_us = MOTOR_PWM_MIN_US;
+    g_motor_gui_test_us = MOTOR_COMMAND_MIN_US;
     g_motor_gui_test_expire_ms = 0U;
     return;
   }
 
   g_motor_gui_test_index = (uint8_t)(motor_index - 1U);
-  g_motor_gui_test_us = (uint16_t)MotorControl_ClampF((float)motor_us, (float)MOTOR_PWM_MIN_US, (float)MOTOR_PWM_MAX_US);
+  g_motor_gui_test_us = (uint16_t)MotorControl_ClampF((float)motor_us, (float)MOTOR_COMMAND_MIN_US, (float)MOTOR_PWM_MAX_US);
   g_motor_gui_test_expire_ms = HAL_GetTick() + MOTOR_TEST_TIMEOUT_MS;
   g_motor_gui_test_active = 1U;
 }
 
 static void MotorGui_HandleDisplayFilter(uint16_t cutoff_hz)
 {
-  float clamped_hz = MotorControl_ClampF((float)cutoff_hz, 5.0f, 150.0f);
+  float clamped_hz = MotorControl_ClampF((float)cutoff_hz, 0.0f, 10.0f);
 
   g_display_filter_cutoff_hz = clamped_hz;
   DisplayFilter_SetCutoffHz(clamped_hz);
@@ -806,7 +852,9 @@ static void MotorOutput_WriteMicroseconds(const uint16_t *motor_us)
 
   /* M1-only DMA DShot bring-up on S1/PB0 (TIM3_CH3). */
   {
-    uint16_t dshot_value = MotorDshot_UsToValue(motor_us[0]);
+    uint16_t min_us = (g_motors_armed != 0U) ? MOTOR_COMMAND_MIN_US : MOTOR_PWM_MIN_US;
+    uint16_t command_us = (uint16_t)MotorControl_ClampF((float)motor_us[0], (float)min_us, (float)MOTOR_PWM_MAX_US);
+    uint16_t dshot_value = MotorDshot_UsToValue(command_us);
     if ((g_motors_armed != 0U) && (dshot_value == 0U))
     {
       dshot_value = MOTOR_DSHOT_MIN_ACTIVE_VALUE;
@@ -818,16 +866,17 @@ static void MotorOutput_WriteMicroseconds(const uint16_t *motor_us)
   uint16_t m2 = MOTOR_PWM_MIN_US;
   uint16_t m3 = MOTOR_PWM_MIN_US;
   uint16_t m4 = MOTOR_PWM_MIN_US;
+  uint16_t min_us = (g_motors_armed != 0U) ? MOTOR_COMMAND_MIN_US : MOTOR_PWM_MIN_US;
 
   if ((g_motor_hw_ready == 0U) || (motor_us == NULL))
   {
     return;
   }
 
-  m1 = (uint16_t)MotorControl_ClampF((float)motor_us[0], (float)MOTOR_PWM_MIN_US, (float)MOTOR_PWM_MAX_US);
-  m2 = (uint16_t)MotorControl_ClampF((float)motor_us[1], (float)MOTOR_PWM_MIN_US, (float)MOTOR_PWM_MAX_US);
-  m3 = (uint16_t)MotorControl_ClampF((float)motor_us[2], (float)MOTOR_PWM_MIN_US, (float)MOTOR_PWM_MAX_US);
-  m4 = (uint16_t)MotorControl_ClampF((float)motor_us[3], (float)MOTOR_PWM_MIN_US, (float)MOTOR_PWM_MAX_US);
+  m1 = (uint16_t)MotorControl_ClampF((float)motor_us[0], (float)min_us, (float)MOTOR_PWM_MAX_US);
+  m2 = (uint16_t)MotorControl_ClampF((float)motor_us[1], (float)min_us, (float)MOTOR_PWM_MAX_US);
+  m3 = (uint16_t)MotorControl_ClampF((float)motor_us[2], (float)min_us, (float)MOTOR_PWM_MAX_US);
+  m4 = (uint16_t)MotorControl_ClampF((float)motor_us[3], (float)min_us, (float)MOTOR_PWM_MAX_US);
 
   __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, m1);
   __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, m2);
@@ -851,9 +900,16 @@ static void MotorControl_UpdateVirtual(void)
   const uint32_t now_ms = HAL_GetTick();
   uint8_t real_mode_on = 0U;
   const float throttle = MotorControl_ChannelToThrottle(g_rc_channels_us[2]);
-  const float roll = MotorControl_ChannelToBiPolar(g_rc_channels_us[0]);
-  const float pitch = MotorControl_ChannelToBiPolar(g_rc_channels_us[1]);
+  const float roll = RATE_CMD_ROLL_SIGN * MotorControl_ChannelToBiPolar(g_rc_channels_us[0]);
+  const float pitch = RATE_CMD_PITCH_SIGN * MotorControl_ChannelToBiPolar(g_rc_channels_us[1]);
   const float yaw = MotorControl_ChannelToBiPolar(g_rc_channels_us[3]);
+  const float roll_rate_cmd = MotorControl_ApplyDeadband(roll, RATE_CMD_DEADBAND) * RATE_CMD_ROLL_MAX_DPS;
+  const float pitch_rate_cmd = MotorControl_ApplyDeadband(pitch, RATE_CMD_DEADBAND) * RATE_CMD_PITCH_MAX_DPS;
+  const float yaw_rate_cmd = MotorControl_ApplyDeadband(yaw, RATE_CMD_DEADBAND) * RATE_CMD_YAW_MAX_DPS;
+
+  g_desired_roll_rate_dps = roll_rate_cmd;
+  g_desired_pitch_rate_dps = pitch_rate_cmd;
+  g_desired_yaw_rate_dps = yaw_rate_cmd;
 
   for (uint8_t mode_ch = MOTOR_MODE_SWITCH_CHANNEL_FIRST; mode_ch <= MOTOR_MODE_SWITCH_CHANNEL_LAST; mode_ch++)
   {
@@ -864,9 +920,9 @@ static void MotorControl_UpdateVirtual(void)
     }
   }
 
-  const float roll_mix = roll * 0.25f;
-  const float pitch_mix = pitch * 0.25f;
-  const float yaw_mix = yaw * 0.20f;
+  const float roll_mix = g_roll_pid_output;
+  const float pitch_mix = g_pitch_pid_output;
+  const float yaw_mix = g_yaw_pid_output;
 
   float motor_norm[MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
 
@@ -1013,17 +1069,58 @@ static void MotorControl_UpdateVirtual(void)
     UNUSED(fixed_test_on);
 #endif
 
-    uint16_t throttle_us = (uint16_t)(MOTOR_PWM_MIN_US + (uint16_t)lroundf(throttle * 1000.0f));
-    if (throttle_us > MOTOR_PWM_MIN_US)
-    {
-      if (throttle_us < MOTOR_SPIN_FLOOR_US)
-      {
-        throttle_us = MOTOR_SPIN_FLOOR_US;
-      }
-    }
+    float mix_min = 1.0f;
+    float mix_max = 0.0f;
+
+    /* Closed-loop Quad-X mix in INAV motor order: M1 AR, M2 FR, M3 AL, M4 FL. */
+    motor_norm[0] = throttle - pitch_mix + roll_mix + yaw_mix; /* M1 aft-right */
+    motor_norm[1] = throttle + pitch_mix + roll_mix - yaw_mix; /* M2 forward-right */
+    motor_norm[2] = throttle - pitch_mix - roll_mix - yaw_mix; /* M3 aft-left */
+    motor_norm[3] = throttle + pitch_mix - roll_mix + yaw_mix; /* M4 forward-left */
+
     for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
     {
-      g_motor_cmd_us[i] = throttle_us;
+      if (motor_norm[i] < mix_min)
+      {
+        mix_min = motor_norm[i];
+      }
+      if (motor_norm[i] > mix_max)
+      {
+        mix_max = motor_norm[i];
+      }
+    }
+
+    if ((mix_min < 0.0f) || (mix_max > 1.0f))
+    {
+      const float range = mix_max - mix_min;
+      if (range > 1.0f)
+      {
+        for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
+        {
+          motor_norm[i] = (motor_norm[i] - mix_min) / range;
+        }
+      }
+      else
+      {
+        const float shift_up = (mix_min < 0.0f) ? (-mix_min) : 0.0f;
+        const float shift_down = (mix_max > 1.0f) ? (mix_max - 1.0f) : 0.0f;
+        const float shift = shift_up - shift_down;
+        for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
+        {
+          motor_norm[i] += shift;
+        }
+      }
+    }
+
+    for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
+    {
+      const float clamped = MotorControl_ClampF(motor_norm[i], 0.0f, 1.0f);
+      uint16_t motor_us = (uint16_t)(MOTOR_COMMAND_MIN_US + (uint16_t)lroundf(clamped * (float)(MOTOR_PWM_MAX_US - MOTOR_COMMAND_MIN_US)));
+      if ((motor_us > MOTOR_COMMAND_MIN_US) && (motor_us < MOTOR_SPIN_FLOOR_US))
+      {
+        motor_us = MOTOR_SPIN_FLOOR_US;
+      }
+      g_motor_cmd_us[i] = motor_us;
     }
 
     MotorOutput_WriteMicroseconds(g_motor_cmd_us);
@@ -1039,18 +1136,10 @@ static void MotorControl_UpdateVirtual(void)
   for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
   {
     const float clamped = MotorControl_ClampF(motor_norm[i], 0.0f, 1.0f);
-    g_motor_cmd_us[i] = (uint16_t)(MOTOR_PWM_MIN_US + (uint16_t)lroundf(clamped * 1000.0f));
+    g_motor_cmd_us[i] = (uint16_t)(MOTOR_COMMAND_MIN_US + (uint16_t)lroundf(clamped * (float)(MOTOR_PWM_MAX_US - MOTOR_COMMAND_MIN_US)));
   }
 
-  {
-    const uint16_t motor_hold_us[MOTOR_COUNT] = {
-      MOTOR_PWM_MIN_US,
-      MOTOR_PWM_MIN_US,
-      MOTOR_PWM_MIN_US,
-      MOTOR_PWM_MIN_US
-    };
-    MotorOutput_WriteMicroseconds(motor_hold_us);
-  }
+  MotorOutput_WriteMicroseconds(g_motor_cmd_us);
 }
 
 static void IMU_ApplyAlignment(float x, float y, float z, float *xo, float *yo, float *zo)
@@ -1189,7 +1278,7 @@ int main(void)
 #if (USB_ENUM_DIAGNOSTIC == 0U)
   MX_I2C1_Init();
   g_battery_adc_ready = MX_ADC1_Init();
-  MX_UART5_Init();
+  MX_USART6_UART_Init();
   MX_USART1_UART_Init();
   MX_UART4_Init();
 #if (MOTOR_INIT_AT_BOOT != 0U)
@@ -1204,6 +1293,9 @@ int main(void)
   uint32_t next_battery_update_ms = 0U;
   uint32_t now_ms = 0U;
   uint32_t next_telemetry_ms = 0U;
+  uint32_t next_tm_link_ms = 0U;
+
+  RateController_Init(&g_rate_controller);
 
   g_usb_ready = 1U;
 
@@ -1215,6 +1307,9 @@ int main(void)
   next_baro_update_ms = HAL_GetTick();
   next_battery_update_ms = HAL_GetTick();
   next_telemetry_ms = HAL_GetTick();
+  next_tm_link_ms = HAL_GetTick();
+
+  (void)TelemetryLink_Init(&huart6);
 
   MotorOutput_BootHold(1000U);
 
@@ -1248,6 +1343,7 @@ int main(void)
 
     CRSF_ProcessUart();
     MotorGui_ProcessUsbCommands();
+    TelemetryLink_Update();
     now_ms = HAL_GetTick();
     if ((g_rc_last_frame_ms != 0U) && ((now_ms - g_rc_last_frame_ms) <= 100U))
     {
@@ -1324,6 +1420,107 @@ int main(void)
       g_display_filter_gx = 0;
       g_display_filter_gy = 0;
       g_display_filter_gz = 0;
+      g_gyro_roll_rate_dps = 0.0f;
+      g_gyro_pitch_rate_dps = 0.0f;
+      g_gyro_yaw_rate_dps = 0.0f;
+    }
+
+    {
+      static uint32_t s_rate_last_update_ms = 0U;
+      uint32_t rate_now_ms = HAL_GetTick();
+      float rate_dt = 0.01f;
+      uint16_t loop_dt_us = 10000U;
+
+      if (s_rate_last_update_ms != 0U)
+      {
+        uint32_t delta_ms = rate_now_ms - s_rate_last_update_ms;
+        rate_dt = (float)delta_ms * 0.001f;
+      }
+      s_rate_last_update_ms = rate_now_ms;
+
+      if (rate_dt < 0.0005f)
+      {
+        rate_dt = 0.0005f;
+      }
+      else if (rate_dt > 0.02f)
+      {
+        rate_dt = 0.02f;
+      }
+
+      {
+        uint32_t dt_us_u32 = (uint32_t)lroundf(rate_dt * 1000000.0f);
+        if (dt_us_u32 > 65535U)
+        {
+          dt_us_u32 = 65535U;
+        }
+        loop_dt_us = (uint16_t)dt_us_u32;
+      }
+
+      if ((sample_valid != 0U) && (g_imu_found != 0U))
+      {
+        RateController_Update(&g_rate_controller,
+                              rate_dt,
+                              g_desired_roll_rate_dps,
+                              g_desired_pitch_rate_dps,
+                              g_desired_yaw_rate_dps,
+                              g_gyro_roll_rate_dps,
+                              g_gyro_pitch_rate_dps,
+                              g_gyro_yaw_rate_dps,
+                              &g_roll_pid_output,
+                              &g_pitch_pid_output,
+                              &g_yaw_pid_output);
+
+        g_roll_rate_error_dps = g_desired_roll_rate_dps - g_gyro_roll_rate_dps;
+        g_pitch_rate_error_dps = g_desired_pitch_rate_dps - g_gyro_pitch_rate_dps;
+        g_yaw_rate_error_dps = g_desired_yaw_rate_dps - g_gyro_yaw_rate_dps;
+      }
+      else
+      {
+        RateController_Reset(&g_rate_controller);
+        g_roll_rate_error_dps = 0.0f;
+        g_pitch_rate_error_dps = 0.0f;
+        g_yaw_rate_error_dps = 0.0f;
+        g_roll_pid_output = 0.0f;
+        g_pitch_pid_output = 0.0f;
+        g_yaw_pid_output = 0.0f;
+      }
+
+      if ((g_motors_armed == 0U) || (g_rc_link_ok == 0U) || (g_rc_channels_us[2] <= (MOTOR_THROTTLE_MIN_US + 25U)))
+      {
+        RateController_Reset(&g_rate_controller);
+      }
+
+      now_ms = HAL_GetTick();
+      if ((int32_t)(now_ms - next_tm_link_ms) >= 0)
+      {
+        TelemetryCombinedFast tm_fast;
+        memset(&tm_fast, 0, sizeof(tm_fast));
+
+        tm_fast.gyroXdps10 = (int16_t)lroundf(g_gyro_roll_rate_dps * 10.0f);
+        tm_fast.gyroYdps10 = (int16_t)lroundf(g_gyro_pitch_rate_dps * 10.0f);
+        tm_fast.gyroZdps10 = (int16_t)lroundf(g_gyro_yaw_rate_dps * 10.0f);
+        tm_fast.rollCd = (int16_t)g_roll_cd;
+        tm_fast.pitchCd = (int16_t)g_pitch_cd;
+        tm_fast.yawCd = (int16_t)g_yaw_cd;
+
+        tm_fast.rcThrottleUs = g_rc_channels_us[2];
+        tm_fast.rcRollUs = g_rc_channels_us[0];
+        tm_fast.rcPitchUs = g_rc_channels_us[1];
+        tm_fast.rcYawUs = g_rc_channels_us[3];
+        tm_fast.rcArmUs = g_rc_channels_us[4];
+
+        tm_fast.motor1Us = g_motor_cmd_us[0];
+        tm_fast.motor2Us = g_motor_cmd_us[1];
+        tm_fast.motor3Us = g_motor_cmd_us[2];
+        tm_fast.motor4Us = g_motor_cmd_us[3];
+
+        tm_fast.loopDtUs = loop_dt_us;
+        tm_fast.armed = g_motors_armed;
+        tm_fast.failsafeFlags = (g_rc_link_ok != 0U) ? 0U : 1U;
+
+        (void)TelemetryLink_SendCombinedFast(&tm_fast);
+        next_tm_link_ms = now_ms + 20U;
+      }
     }
 
     now_ms = HAL_GetTick();
@@ -1433,6 +1630,18 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
     (void)HAL_UART_Receive_IT(&huart4, &g_uart4_rx_byte, 1U);
   }
+  else if (huart->Instance == USART6)
+  {
+    TelemetryLink_OnUartRxCplt(huart);
+  }
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART6)
+  {
+    TelemetryLink_OnUartTxCplt(huart);
+  }
 }
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
@@ -1441,6 +1650,10 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   {
     (void)HAL_UART_AbortReceive(huart);
     (void)HAL_UART_Receive_IT(&huart4, &g_uart4_rx_byte, 1U);
+  }
+  else if (huart->Instance == USART6)
+  {
+    TelemetryLink_OnUartError(huart);
   }
 }
 
@@ -1916,50 +2129,50 @@ static void MX_UART4_Init(void)
 }
 
 /**
-  * @brief UART5 Initialization Function
+   * @brief USART6 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_UART5_Init(void)
+  static void MX_USART6_UART_Init(void)
 {
 
-  /* USER CODE BEGIN UART5_Init 0 */
+    /* USER CODE BEGIN USART6_Init 0 */
 
-  /* USER CODE END UART5_Init 0 */
+    /* USER CODE END USART6_Init 0 */
 
-  /* USER CODE BEGIN UART5_Init 1 */
+    /* USER CODE BEGIN USART6_Init 1 */
 
-  /* USER CODE END UART5_Init 1 */
-  huart5.Instance = UART5;
-  huart5.Init.BaudRate = 115200;
-  huart5.Init.WordLength = UART_WORDLENGTH_8B;
-  huart5.Init.StopBits = UART_STOPBITS_1;
-  huart5.Init.Parity = UART_PARITY_NONE;
-  huart5.Init.Mode = UART_MODE_TX_RX;
-  huart5.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart5.Init.OverSampling = UART_OVERSAMPLING_16;
-  huart5.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  huart5.Init.ClockPrescaler = UART_PRESCALER_DIV1;
-  huart5.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart5) != HAL_OK)
+    /* USER CODE END USART6_Init 1 */
+    huart6.Instance = USART6;
+    huart6.Init.BaudRate = 921600;
+    huart6.Init.WordLength = UART_WORDLENGTH_8B;
+    huart6.Init.StopBits = UART_STOPBITS_1;
+    huart6.Init.Parity = UART_PARITY_NONE;
+    huart6.Init.Mode = UART_MODE_TX_RX;
+    huart6.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart6.Init.OverSampling = UART_OVERSAMPLING_16;
+    huart6.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+    huart6.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+    huart6.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+    if (HAL_UART_Init(&huart6) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_UARTEx_SetTxFifoThreshold(&huart5, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+    if (HAL_UARTEx_SetTxFifoThreshold(&huart6, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_UARTEx_SetRxFifoThreshold(&huart5, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+    if (HAL_UARTEx_SetRxFifoThreshold(&huart6, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_UARTEx_DisableFifoMode(&huart5) != HAL_OK)
+    if (HAL_UARTEx_DisableFifoMode(&huart6) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN UART5_Init 2 */
+    /* USER CODE BEGIN USART6_Init 2 */
 
-  /* USER CODE END UART5_Init 2 */
+    /* USER CODE END USART6_Init 2 */
 
 }
 
@@ -2120,14 +2333,14 @@ static void Telemetry_SendPacket(int32_t pitch_cd, int32_t roll_cd, int32_t yaw_
                                  int16_t ax_raw, int16_t ay_raw, int16_t az_raw,
                                  uint32_t pressure_pa, int32_t altitude_cm)
 {
-  uint8_t frame[4U + TELEMETRY_PACKET_PAYLOAD_BYTES_V6 + 1U];
+  uint8_t frame[4U + TELEMETRY_PACKET_PAYLOAD_BYTES_V8 + 1U];
   uint8_t checksum = 0U;
   uint8_t payload_index = 0U;
 
   frame[0] = TELEMETRY_PACKET_SOF1;
   frame[1] = TELEMETRY_PACKET_SOF2;
   frame[2] = TELEMETRY_PACKET_TYPE_TELEMETRY;
-  frame[3] = TELEMETRY_PACKET_PAYLOAD_BYTES_V6;
+  frame[3] = TELEMETRY_PACKET_PAYLOAD_BYTES_V8;
 
   Packet_PutU32LE(&frame[4U + payload_index], g_telemetry_sequence++);
   payload_index = (uint8_t)(payload_index + 4U);
@@ -2199,7 +2412,7 @@ static void Telemetry_SendPacket(int32_t pitch_cd, int32_t roll_cd, int32_t yaw_
     payload_index = (uint8_t)(payload_index + 2U);
   }
 
-  Packet_PutU16LE(&frame[4U + payload_index], (uint16_t)MotorControl_ClampF(g_display_filter_cutoff_hz, 5.0f, 150.0f));
+  Packet_PutU16LE(&frame[4U + payload_index], (uint16_t)MotorControl_ClampF(g_display_filter_cutoff_hz, 0.0f, 10.0f));
   payload_index = (uint8_t)(payload_index + 2U);
 
   Packet_PutU16LE(&frame[4U + payload_index], g_battery_adc_raw_last);
@@ -2209,12 +2422,40 @@ static void Telemetry_SendPacket(int32_t pitch_cd, int32_t roll_cd, int32_t yaw_
   frame[4U + payload_index] = g_battery_adc_ready;
   payload_index = (uint8_t)(payload_index + 1U);
 
-  for (uint32_t i = 2U; i < (4U + TELEMETRY_PACKET_PAYLOAD_BYTES_V6); i++)
+  Packet_PutS16LE(&frame[4U + payload_index], (int16_t)lroundf(g_desired_roll_rate_dps * 10.0f));
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutS16LE(&frame[4U + payload_index], (int16_t)lroundf(g_desired_pitch_rate_dps * 10.0f));
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutS16LE(&frame[4U + payload_index], (int16_t)lroundf(g_desired_yaw_rate_dps * 10.0f));
+  payload_index = (uint8_t)(payload_index + 2U);
+
+  Packet_PutS16LE(&frame[4U + payload_index], (int16_t)lroundf(g_gyro_roll_rate_dps * 10.0f));
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutS16LE(&frame[4U + payload_index], (int16_t)lroundf(g_gyro_pitch_rate_dps * 10.0f));
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutS16LE(&frame[4U + payload_index], (int16_t)lroundf(g_gyro_yaw_rate_dps * 10.0f));
+  payload_index = (uint8_t)(payload_index + 2U);
+
+  Packet_PutS16LE(&frame[4U + payload_index], (int16_t)lroundf(g_roll_rate_error_dps * 10.0f));
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutS16LE(&frame[4U + payload_index], (int16_t)lroundf(g_pitch_rate_error_dps * 10.0f));
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutS16LE(&frame[4U + payload_index], (int16_t)lroundf(g_yaw_rate_error_dps * 10.0f));
+  payload_index = (uint8_t)(payload_index + 2U);
+
+  Packet_PutS16LE(&frame[4U + payload_index], (int16_t)lroundf(g_roll_pid_output * 10000.0f));
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutS16LE(&frame[4U + payload_index], (int16_t)lroundf(g_pitch_pid_output * 10000.0f));
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutS16LE(&frame[4U + payload_index], (int16_t)lroundf(g_yaw_pid_output * 10000.0f));
+  payload_index = (uint8_t)(payload_index + 2U);
+
+  for (uint32_t i = 2U; i < (4U + TELEMETRY_PACKET_PAYLOAD_BYTES_V8); i++)
   {
     checksum ^= frame[i];
   }
 
-  frame[4U + TELEMETRY_PACKET_PAYLOAD_BYTES_V6] = checksum;
+  frame[4U + TELEMETRY_PACKET_PAYLOAD_BYTES_V8] = checksum;
 
   Serial_Write(frame, (uint16_t)sizeof(frame));
 }
@@ -2704,6 +2945,9 @@ static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax
   float gz_aligned = 0.0f;
 
   IMU_ApplyAlignment(gx_dps, gy_dps, gz_dps, &gx_aligned, &gy_aligned, &gz_aligned);
+  g_gyro_roll_rate_dps = gx_aligned;
+  g_gyro_pitch_rate_dps = gy_aligned;
+  g_gyro_yaw_rate_dps = gz_aligned;
   
   /* Convert accel to g units (±16g range) */
   float ax_g = (float)ax / IMU_ACCEL_LSB_PER_G;
