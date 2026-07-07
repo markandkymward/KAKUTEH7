@@ -20,7 +20,7 @@ constexpr uint16_t kTcpPort = 5761;
 
 constexpr int kUartRxPin = 16;
 constexpr int kUartTxPin = 17;
-constexpr uint32_t kUartBaud = 921600;
+constexpr uint32_t kUartBaud = 420000;
 
 constexpr size_t kFcToTcpRingSize = 8192;
 constexpr size_t kTcpToFcRingSize = 8192;

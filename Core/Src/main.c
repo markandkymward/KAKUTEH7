@@ -1,4 +1,4 @@
-/* USER CODE BEGIN Header */
+﻿/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
   * @file           : main.c
@@ -2144,7 +2144,7 @@ static void MX_UART4_Init(void)
 
     /* USER CODE END USART6_Init 1 */
     huart6.Instance = USART6;
-    huart6.Init.BaudRate = 921600;
+    huart6.Init.BaudRate = 420000;
     huart6.Init.WordLength = UART_WORDLENGTH_8B;
     huart6.Init.StopBits = UART_STOPBITS_1;
     huart6.Init.Parity = UART_PARITY_NONE;
