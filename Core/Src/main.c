@@ -76,10 +76,13 @@
 #define IMU_ALIGN_CW90          1U
 #define IMU_ALIGN_CW180         2U
 #define IMU_ALIGN_CW270         3U
+/* Body roll sign convention: -1 flips roll to match aircraft right-wing-down expectation. */
+#define IMU_ROLL_SIGN           (-1.0f)
 /* Temporary diagnostic mode: keep only USB bring-up to isolate enumeration issues. */
 #define USB_ENUM_DIAGNOSTIC     0U
-/* Board-to-sensor alignment mapping (matches verified physical orientation). */
-#define IMU_SENSOR_ALIGNMENT     IMU_ALIGN_CW270
+/* Board-to-sensor alignment mapping.
+ * Set to CW0 to keep body axes direct: X=longitudinal, Y=lateral, Z=up. */
+#define IMU_SENSOR_ALIGNMENT     IMU_ALIGN_CW0
 
 #define CRSF_FRAME_TYPE_RC_CHANNELS     0x16U
 #define CRSF_SYNC_BYTE                  0xC8U
@@ -293,7 +296,7 @@ static volatile uint32_t g_crsf_last_isr_byte_ms = 0U;
 #define TELEMETRY_PACKET_TYPE_TELEMETRY  0x01U
 #define TELEMETRY_PACKET_TYPE_MOTOR_TEST 0x10U
 #define TELEMETRY_PACKET_TYPE_DISPLAY_FILTER 0x11U
-#define TELEMETRY_PACKET_PAYLOAD_BYTES_V8    122U
+#define TELEMETRY_PACKET_PAYLOAD_BYTES_V8    130U
 #define MOTOR_TEST_PAYLOAD_BYTES         3U
 #define DISPLAY_FILTER_PAYLOAD_BYTES     2U
 #define MOTOR_TEST_TIMEOUT_MS            250U
@@ -1148,6 +1151,12 @@ static void IMU_ApplyAlignment(float x, float y, float z, float *xo, float *yo, 
   {
     return;
   }
+
+  /*
+   * Body-frame convention used by attitude/rate telemetry:
+   * X = forward, Y = right, Z = up.
+   * Positive roll is right-wing-down (right-hand rule about +X).
+   */
 
   switch (IMU_SENSOR_ALIGNMENT)
   {
@@ -2450,6 +2459,16 @@ static void Telemetry_SendPacket(int32_t pitch_cd, int32_t roll_cd, int32_t yaw_
   Packet_PutS16LE(&frame[4U + payload_index], (int16_t)lroundf(g_yaw_pid_output * 10000.0f));
   payload_index = (uint8_t)(payload_index + 2U);
 
+  /* Export AHRS quaternion directly so GUI 3D pose matches firmware/control-frame orientation. */
+  Packet_PutS16LE(&frame[4U + payload_index], (int16_t)lroundf(g_q0 * 10000.0f));
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutS16LE(&frame[4U + payload_index], (int16_t)lroundf(g_q1 * 10000.0f));
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutS16LE(&frame[4U + payload_index], (int16_t)lroundf(g_q2 * 10000.0f));
+  payload_index = (uint8_t)(payload_index + 2U);
+  Packet_PutS16LE(&frame[4U + payload_index], (int16_t)lroundf(g_q3 * 10000.0f));
+  payload_index = (uint8_t)(payload_index + 2U);
+
   for (uint32_t i = 2U; i < (4U + TELEMETRY_PACKET_PAYLOAD_BYTES_V8); i++)
   {
     checksum ^= frame[i];
@@ -2877,7 +2896,7 @@ static void IMU_CalibrateLevel(void)
       
       /* Tilt-stable accel angles: minimizes roll/pitch cross-coupling near ±90 deg pitch. */
       float accel_pitch = atan2f(-ax_aligned, sqrtf((ay_aligned * ay_aligned) + (az_aligned * az_aligned))) * 180.0f / 3.14159265f;
-      float accel_roll = -atan2f(ay_aligned, az_aligned) * 180.0f / 3.14159265f;
+      float accel_roll = IMU_ROLL_SIGN * atan2f(ay_aligned, az_aligned) * 180.0f / 3.14159265f;
       
       sum_pitch += accel_pitch;
       sum_roll += accel_roll;
@@ -2945,7 +2964,7 @@ static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax
   float gz_aligned = 0.0f;
 
   IMU_ApplyAlignment(gx_dps, gy_dps, gz_dps, &gx_aligned, &gy_aligned, &gz_aligned);
-  g_gyro_roll_rate_dps = gx_aligned;
+  g_gyro_roll_rate_dps = IMU_ROLL_SIGN * gx_aligned;
   g_gyro_pitch_rate_dps = gy_aligned;
   g_gyro_yaw_rate_dps = gz_aligned;
   
@@ -2998,7 +3017,7 @@ static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax
     g_q3 = q.element.z;
 
     euler = FusionQuaternionToEuler(q);
-    roll_next = IMU_SanitizeAngleDeg(-euler.angle.roll, g_roll_fused);
+    roll_next = IMU_SanitizeAngleDeg(IMU_ROLL_SIGN * euler.angle.roll, g_roll_fused);
     pitch_next = IMU_SanitizeAngleDeg(euler.angle.pitch, g_pitch_fused);
     yaw_next = IMU_SanitizeAngleDeg(euler.angle.yaw, g_yaw_fused);
 

@@ -21,6 +21,7 @@ import struct
 import threading
 import time
 import tkinter as tk
+from types import SimpleNamespace
 from collections import deque
 from dataclasses import dataclass, field
 from tkinter import ttk
@@ -68,6 +69,7 @@ TELEMETRY_PAYLOAD_LEN_V6 = 98
 TELEMETRY_PAYLOAD_LEN_V7 = 104
 TELEMETRY_PAYLOAD_LEN_V8 = 116
 TELEMETRY_PAYLOAD_LEN_V9 = 122
+TELEMETRY_PAYLOAD_LEN_V10 = 130
 TELEMETRY_STRUCT_V1 = struct.Struct("<Iiii6hBIIi16H")
 TELEMETRY_STRUCT_V2 = struct.Struct("<Iiii6hBIIi16HBB4H")
 TELEMETRY_STRUCT_V3 = struct.Struct("<Iiii6hBIIi16HBBB4H")
@@ -77,10 +79,22 @@ TELEMETRY_STRUCT_V6 = struct.Struct("<Iiii9hBIIiH16HBBB5HHBB")
 TELEMETRY_STRUCT_V7 = struct.Struct("<Iiii9hBIIiH16HBBB5HHBBhhh")
 TELEMETRY_STRUCT_V8 = struct.Struct("<Iiii9hBIIiH16HBBB5HHBBhhhhhhhhh")
 TELEMETRY_STRUCT_V9 = struct.Struct("<Iiii9hBIIiH16HBBB5HHBBhhhhhhhhhhhh")
+TELEMETRY_STRUCT_V10 = struct.Struct("<Iiii9hBIIiH16HBBB5HHBBhhhhhhhhhhhhhhhh")
 IMU_ACCEL_LSB_PER_G = 2048.0
 IMU_GYRO_DPS_PER_LSB = 2000.0 / 32768.0
 LAYOUT_SCHEMA_VERSION = 2
 TM_COMBINED_FAST_STRUCT = struct.Struct("<hhhhhhHHHHHHHHHHBBIIIII")
+
+GUI_UPDATE_INTERVAL_MS = 16
+SERIAL_READ_TIMEOUT_S = 0.03
+SOCKET_READ_TIMEOUT_S = 0.05
+FFT_DRAW_EVERY_N_FRAMES = 3
+
+PERF_MODE_NORMAL = "Normal"
+PERF_MODE_LOW_LATENCY = "Low-latency"
+
+# GUI display convention layer (does not change FC telemetry values).
+DISPLAY_YAW_SIGN = -1.0
 
 
 def _checksum(packet_type: int, payload: bytes) -> int:
@@ -203,6 +217,10 @@ def _decode_frames(buffer: bytearray) -> Iterable[tuple[int, ...]]:
             yield TELEMETRY_STRUCT_V9.unpack(payload)
             continue
 
+        if payload_len == TELEMETRY_PAYLOAD_LEN_V10:
+            yield TELEMETRY_STRUCT_V10.unpack(payload)
+            continue
+
 
 def _build_motor_test_packet(motor_index: int, motor_us: int) -> bytes:
     payload = bytes(
@@ -275,6 +293,7 @@ class TelemetryState:
     roll_pid_output: float = 0.0
     pitch_pid_output: float = 0.0
     yaw_pid_output: float = 0.0
+    fw_quaternion: tuple[float, float, float, float] | None = None
     rc_link_ok: bool = False
     rc_frames: int = 0
     channels: list[int] = field(default_factory=lambda: [0] * 16)
@@ -338,7 +357,56 @@ class SerialReader(threading.Thread):
                 return
 
     def _apply_decoded(self, candidate: str, values: tuple[int, ...]) -> None:
-        if len(values) == 57:
+        fw_quaternion = None
+
+        if len(values) == 61:
+            (
+                sequence,
+                pitch_cd,
+                roll_cd,
+                yaw_cd,
+                gx,
+                gy,
+                gz,
+                gx_filtered,
+                gy_filtered,
+                gz_filtered,
+                ax,
+                ay,
+                az,
+                rc_link,
+                rc_frames,
+                pressure_pa,
+                altitude_cm,
+                battery_mv,
+                *channels,
+            ) = values
+            display_filter_cutoff_hz = int(channels[23])
+            battery_adc_raw = int(channels[24])
+            battery_adc_channel = int(channels[25])
+            battery_adc_ready = int(channels[26])
+            desired_roll_rate_dps = int(channels[27]) * 0.1
+            desired_pitch_rate_dps = int(channels[28]) * 0.1
+            desired_yaw_rate_dps = int(channels[29]) * 0.1
+            gyro_roll_rate_dps = int(channels[30]) * 0.1
+            gyro_pitch_rate_dps = int(channels[31]) * 0.1
+            gyro_yaw_rate_dps = int(channels[32]) * 0.1
+            roll_rate_error_dps = int(channels[33]) * 0.1
+            pitch_rate_error_dps = int(channels[34]) * 0.1
+            yaw_rate_error_dps = int(channels[35]) * 0.1
+            roll_pid_output = int(channels[36]) * 0.0001
+            pitch_pid_output = int(channels[37]) * 0.0001
+            yaw_pid_output = int(channels[38]) * 0.0001
+            fw_quaternion = (
+                int(channels[39]) * 0.0001,
+                int(channels[40]) * 0.0001,
+                int(channels[41]) * 0.0001,
+                int(channels[42]) * 0.0001,
+            )
+            battery_mv = int(battery_mv)
+            battery_voltage_v = float(battery_mv) * 0.001
+            gyro_filter_available = True
+        elif len(values) == 57:
             (
                 sequence,
                 pitch_cd,
@@ -664,6 +732,7 @@ class SerialReader(threading.Thread):
             self.state.roll_pid_output = float(roll_pid_output)
             self.state.pitch_pid_output = float(pitch_pid_output)
             self.state.yaw_pid_output = float(yaw_pid_output)
+            self.state.fw_quaternion = fw_quaternion
             self.state.rc_link_ok = bool(rc_link)
             self.state.rc_frames = int(rc_frames)
             self.state.channels = [int(v) for v in channels]
@@ -788,7 +857,7 @@ class SerialReader(threading.Thread):
                 candidate = f"{host}:{tcp_port}"
                 try:
                     with socket.create_connection((host, tcp_port), timeout=2.0) as sock:
-                        sock.settimeout(0.2)
+                        sock.settimeout(SOCKET_READ_TIMEOUT_S)
                         tm_parser = tm_protocol.StreamParser() if tm_protocol is not None else None
                         with self.lock:
                             self.state.connected = True
@@ -847,7 +916,7 @@ class SerialReader(threading.Thread):
                 if not self.running:
                     break
                 try:
-                    with serial.Serial(candidate, self.baud, timeout=0.2) as ser:
+                    with serial.Serial(candidate, self.baud, timeout=SERIAL_READ_TIMEOUT_S) as ser:
                         connected_once = True
                         with self.lock:
                             self.state.connected = True
@@ -915,8 +984,11 @@ class TelemetryApp:
         self.battery_var = tk.StringVar(value="BAT n/a")
         self.filter_target_var = tk.StringVar(value="Requested cutoff: 5 Hz")
         self.filter_fw_var = tk.StringVar(value="Firmware cutoff: 5 Hz")
+        self.performance_mode_var = tk.StringVar(value=PERF_MODE_NORMAL)
         self._filter_command_after_id: str | None = None
         self._last_filter_sent = 5
+        self._ui_interval_ms = GUI_UPDATE_INTERVAL_MS
+        self._fft_every_n_frames = FFT_DRAW_EVERY_N_FRAMES
 
         header = ttk.Frame(root, padding=10)
         header.pack(fill=tk.X)
@@ -926,6 +998,19 @@ class TelemetryApp:
         env_row.pack(fill=tk.X)
         ttk.Label(env_row, textvariable=self.baro_var, font=("Consolas", 11)).pack(side=tk.LEFT, anchor=tk.W)
         ttk.Label(env_row, textvariable=self.battery_var, font=("Consolas", 11)).pack(side=tk.RIGHT, anchor=tk.E)
+
+        perf_row = ttk.Frame(header)
+        perf_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(perf_row, text="Performance:").pack(side=tk.LEFT)
+        perf_combo = ttk.Combobox(
+            perf_row,
+            width=14,
+            textvariable=self.performance_mode_var,
+            values=(PERF_MODE_NORMAL, PERF_MODE_LOW_LATENCY),
+            state="readonly",
+        )
+        perf_combo.pack(side=tk.LEFT, padx=(8, 0))
+        perf_combo.bind("<<ComboboxSelected>>", self._on_performance_mode_changed)
 
         body = ttk.Frame(root, padding=(10, 0, 10, 10))
         body.pack(fill=tk.BOTH, expand=True)
@@ -1051,6 +1136,7 @@ class TelemetryApp:
         self._fusion_bias = None
         self._fusion_last_monotonic = 0.0
         self._fusion_ready = False
+        self._fft_frame_counter = 0
         self._gyro_raw_history = deque(maxlen=240)
         self._gyro_filtered_history = deque(maxlen=240)
         self._gyro_time_history = deque(maxlen=240)
@@ -1083,7 +1169,20 @@ class TelemetryApp:
                 )
             self._fusion_ready = self._fusion_bias is not None
 
+        self._apply_performance_mode(self.performance_mode_var.get())
         self._apply_saved_layout_async()
+
+    def _apply_performance_mode(self, mode: str) -> None:
+        if mode == PERF_MODE_NORMAL:
+            self._ui_interval_ms = 33
+            self._fft_every_n_frames = 1
+            return
+
+        self._ui_interval_ms = GUI_UPDATE_INTERVAL_MS
+        self._fft_every_n_frames = FFT_DRAW_EVERY_N_FRAMES
+
+    def _on_performance_mode_changed(self, _event=None) -> None:
+        self._apply_performance_mode(self.performance_mode_var.get())
 
     def _load_layout_config(self) -> dict[str, object]:
         try:
@@ -1277,7 +1376,7 @@ class TelemetryApp:
         # Draw a proper attitude sphere slice: horizon shifts with pitch and rotates with roll.
         roll_rad = math.radians(roll)
         pitch_px = max(-h * 0.35, min(h * 0.35, pitch * (h / 90.0) * 0.5))
-        horizon_y = cy + pitch_px
+        horizon_y = cy - pitch_px
 
         # Use an oversized world polygon and rotate it into screen space.
         span = max(w, h) * 2.4
@@ -1331,7 +1430,7 @@ class TelemetryApp:
         # Yaw tape
         bar_y = h - 32
         c.create_rectangle(20, bar_y, w - 20, bar_y + 16, outline="#94a3b8", width=1)
-        yaw_norm = ((yaw + 180.0) % 360.0) - 180.0
+        yaw_norm = (((DISPLAY_YAW_SIGN * yaw) + 180.0) % 360.0) - 180.0
         x = 20 + ((yaw_norm + 180.0) / 360.0) * (w - 40)
         c.create_line(x, bar_y, x, bar_y + 16, fill="#f59e0b", width=3)
 
@@ -1681,8 +1780,9 @@ class TelemetryApp:
             r22 = 1.0 - 2.0 * (qx * qx + qy * qy)
         else:
             pr = math.radians(pitch)
-            rr = math.radians(roll)
-            yr = math.radians(yaw)
+            # Match roll visual direction to attitude indicator/body-frame convention.
+            rr = math.radians(-roll)
+            yr = math.radians(DISPLAY_YAW_SIGN * yaw)
 
             cp = math.cos(pr)
             sp = math.sin(pr)
@@ -1712,10 +1812,10 @@ class TelemetryApp:
 
         def project(v: tuple[float, float, float]) -> tuple[float, float, float]:
             x, y, z = v
-            # Display mapping so zero attitude appears flat and +X points into screen.
-            x_view = -y
-            y_view = z
-            z_view = -x
+            # Oblique camera mapping so pitch/roll are visually distinct and easier to read.
+            x_view = (0.85 * x) + (0.85 * y)
+            y_view = (0.45 * x) - (0.45 * y) + (1.00 * z)
+            z_view = (0.35 * x) - (0.35 * y)
             dist = 420.0
             scale = dist / (dist - z_view)
             sx = cx + x_view * scale * 1.2
@@ -1749,9 +1849,9 @@ class TelemetryApp:
         c.create_line(ox, oy, xx, xy, fill="#ef4444", width=3)
         c.create_line(ox, oy, yx, yy, fill="#22c55e", width=3)
         c.create_line(ox, oy, zx, zy, fill="#3b82f6", width=3)
-        c.create_text(xx + 8, xy, anchor="w", fill="#fecaca", font=("Consolas", 10, "bold"), text="+X")
-        c.create_text(yx + 8, yy, anchor="w", fill="#bbf7d0", font=("Consolas", 10, "bold"), text="+Y")
-        c.create_text(zx + 8, zy, anchor="w", fill="#bfdbfe", font=("Consolas", 10, "bold"), text="+Z")
+        c.create_text(xx + 8, xy, anchor="w", fill="#fecaca", font=("Consolas", 10, "bold"), text="X FWD")
+        c.create_text(yx + 8, yy, anchor="w", fill="#bbf7d0", font=("Consolas", 10, "bold"), text="Y RIGHT")
+        c.create_text(zx + 8, zy, anchor="w", fill="#bfdbfe", font=("Consolas", 10, "bold"), text="Z UP")
 
         # Draw top-face contour brighter.
         top_face = [4, 5, 6, 7, 4]
@@ -1768,7 +1868,8 @@ class TelemetryApp:
         c.create_line(ax0, ay0, ax1, ay1, fill="#f59e0b", width=3)
         c.create_polygon(ax1, ay1, ax2, ay2, ax3, ay3, fill="#f59e0b", outline="#fbbf24")
 
-        c.create_text(10, 10, anchor="nw", fill="#e5e7eb", font=("Consolas", 11, "bold"), text="FRONT (+X)")
+        c.create_text(10, 10, anchor="nw", fill="#e5e7eb", font=("Consolas", 11, "bold"), text="FRONT (X FORWARD)")
+        c.create_text(10, 30, anchor="nw", fill="#94a3b8", font=("Consolas", 9), text="BODY AXES: X FORWARD  Y RIGHT  Z UP")
         c.create_text(
             10,
             h - 12,
@@ -1780,8 +1881,8 @@ class TelemetryApp:
 
     @staticmethod
     def _apply_alignment(x: float, y: float, z: float) -> tuple[float, float, float]:
-        # Must match firmware IMU_SENSOR_ALIGNMENT = IMU_ALIGN_CW270.
-        return -y, x, z
+        # Must match firmware IMU_SENSOR_ALIGNMENT = IMU_ALIGN_CW0.
+        return x, y, z
 
     def _compute_fusion_euler(self, snapshot: TelemetryState) -> tuple[float, float, float] | None:
         if (not self._fusion_ready) or (self._fusion_ahrs is None) or (self._fusion_bias is None) or (np is None):
@@ -1927,6 +2028,7 @@ class TelemetryApp:
                 roll_pid_output=self.state.roll_pid_output,
                 pitch_pid_output=self.state.pitch_pid_output,
                 yaw_pid_output=self.state.yaw_pid_output,
+                fw_quaternion=self.state.fw_quaternion,
                 rc_link_ok=self.state.rc_link_ok,
                 rc_frames=self.state.rc_frames,
                 channels=list(self.state.channels),
@@ -1952,9 +2054,16 @@ class TelemetryApp:
             f"SEQ {snapshot.sequence:06d}   RC {link}   RF {snapshot.rc_frames:6d}   "
             f"MOT {motor_mode_text}/{motor_state_text}/{gui_test_text}   SER {ser} ({port})   Age {age_ms:6.1f} ms"
         )
+        ax_body_g, ay_body_g, az_body_g = self._apply_alignment(
+            snapshot.ax / IMU_ACCEL_LSB_PER_G,
+            snapshot.ay / IMU_ACCEL_LSB_PER_G,
+            snapshot.az / IMU_ACCEL_LSB_PER_G,
+        )
         self.imu_var.set(
-            f"GX {snapshot.gx:6d}  GY {snapshot.gy:6d}  GZ {snapshot.gz:6d}    "
-            f"AX {snapshot.ax:6d}  AY {snapshot.ay:6d}  AZ {snapshot.az:6d}"
+            f"Raw G[{snapshot.gx:6d},{snapshot.gy:6d},{snapshot.gz:6d}] "
+            f"A[{snapshot.ax:6d},{snapshot.ay:6d},{snapshot.az:6d}]    "
+            f"Body gyro dps[{snapshot.gyro_roll_rate_dps:+6.1f},{snapshot.gyro_pitch_rate_dps:+6.1f},{snapshot.gyro_yaw_rate_dps:+6.1f}] "
+            f"Body accel g[{ax_body_g:+5.2f},{ay_body_g:+5.2f},{az_body_g:+5.2f}]"
         )
         self.baro_var.set(
             f"BARO P {snapshot.pressure_pa:7d} Pa   ALT {snapshot.altitude_cm / 100.0:+7.2f} m"
@@ -1988,27 +2097,92 @@ class TelemetryApp:
             f"Y {snapshot.yaw_pid_output:+0.3f}"
         )
 
-        # Keep startup attitude aligned with firmware's calibrated level estimate.
-        if snapshot.gyro_filter_available:
-            fusion_quaternion = None
-            source_pitch, source_roll, source_yaw = snapshot.pitch_deg, snapshot.roll_deg, snapshot.yaw_deg
+        # Strict FC attitude mode: render from telemetry Euler so 3D matches angle-mode control data.
+        source_pitch, source_roll, source_yaw = snapshot.pitch_deg, snapshot.roll_deg, snapshot.yaw_deg
+        draw_quaternion = None
+        if snapshot.fw_quaternion is not None:
+            fw_qw, fw_qx, fw_qy, fw_qz = snapshot.fw_quaternion
+            fw_quaternion = SimpleNamespace(w=fw_qw, x=fw_qx, y=fw_qy, z=fw_qz)
+            fusion_quaternion = fw_quaternion
+            q_source = "FW"
+            draw_source = "FC-EULER"
+            self._render_prev_pitch = source_pitch
+            self._render_prev_roll = source_roll
+            self._render_prev_yaw = source_yaw
+            self._render_prev_valid = True
         else:
             fusion_quaternion = self._compute_fusion_quaternion(snapshot)
-            if fusion_quaternion is not None:
-                source_pitch, source_roll, source_yaw = self._quaternion_to_euler_display(fusion_quaternion)
-            else:
-                source_pitch, source_roll, source_yaw = snapshot.pitch_deg, snapshot.roll_deg, snapshot.yaw_deg
+            q_source = "GUI"
+            draw_source = "GUI-EULER"
+            source_pitch, source_roll, source_yaw = self._select_continuous_euler(
+                source_pitch,
+                source_roll,
+                source_yaw,
+            )
+
+        self.header_var.set(self.header_var.get() + f"   3D {draw_source}")
+
+        if fusion_quaternion is not None:
+            q_text = (
+                f"Q[{q_source}] w:{float(fusion_quaternion.w):+0.4f} "
+                f"x:{float(fusion_quaternion.x):+0.4f} "
+                f"y:{float(fusion_quaternion.y):+0.4f} "
+                f"z:{float(fusion_quaternion.z):+0.4f}"
+            )
+        else:
+            q_text = "Q n/a"
+
+        euler_tm_text = (
+            f"E[TM] P:{snapshot.pitch_deg:+6.2f} "
+            f"R:{snapshot.roll_deg:+6.2f} "
+            f"Y:{snapshot.yaw_deg:+6.2f}"
+        )
+        euler_draw_text = (
+            f"E[DRAW] P:{source_pitch:+6.2f} "
+            f"R:{source_roll:+6.2f} "
+            f"Y:{source_yaw:+6.2f}"
+        )
+        pitch_delta = self._angle_delta_deg(source_pitch, snapshot.pitch_deg)
+        roll_delta = self._angle_delta_deg(source_roll, snapshot.roll_deg)
+        yaw_delta = self._angle_delta_deg(source_yaw, snapshot.yaw_deg)
+        euler_delta_text = (
+            f"E[DELTA] P:{pitch_delta:+6.2f} "
+            f"R:{roll_delta:+6.2f} "
+            f"Y:{yaw_delta:+6.2f}"
+        )
+        mismatch = (
+            (abs(pitch_delta) > 0.5)
+            or (abs(roll_delta) > 0.5)
+            or (abs(yaw_delta) > 0.5)
+        )
+        euler_match_text = "E[MATCH] NO" if mismatch else "E[MATCH] YES"
+
+        self.footer_var.set(
+            self.footer_var.get()
+            + " | "
+            + q_text
+            + " | "
+            + euler_tm_text
+            + " | "
+            + euler_draw_text
+            + " | "
+            + euler_delta_text
+            + " | "
+            + euler_match_text
+        )
 
         self._append_gyro_history(snapshot)
         self._draw_attitude(source_pitch, source_roll, source_yaw)
         self._draw_sticks(snapshot.channels)
-        self._draw_board_3d(source_pitch, source_roll, source_yaw, fusion_quaternion)
+        self._draw_board_3d(source_pitch, source_roll, source_yaw, draw_quaternion)
         self._draw_gyro_graph(snapshot)
-        self._draw_fft_graph(snapshot)
+        self._fft_frame_counter = (self._fft_frame_counter + 1) % self._fft_every_n_frames
+        if self._fft_frame_counter == 0:
+            self._draw_fft_graph(snapshot)
         self._draw_channels(snapshot.channels)
         self._draw_motors(snapshot.motor_mode, snapshot.motors_armed, snapshot.motors_us)
 
-        self.root.after(33, self.update)
+        self.root.after(self._ui_interval_ms, self.update)
 
 
 def main() -> int:
