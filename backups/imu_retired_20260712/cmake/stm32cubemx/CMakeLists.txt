@@ -11,11 +11,10 @@ set(MX_Defines_Syms
 
 # STM32CubeMX generated include paths
 set(MX_Include_Dirs
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Attitude
     ${CMAKE_CURRENT_SOURCE_DIR}/../../USB_DEVICE/App
     ${CMAKE_CURRENT_SOURCE_DIR}/../../USB_DEVICE/Target
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../Attitude
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Inc
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/Fusion
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Drivers/STM32H7xx_HAL_Driver/Inc
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Drivers/STM32H7xx_HAL_Driver/Inc/Legacy
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Middlewares/ST/STM32_USB_Device_Library/Core/Inc
@@ -26,27 +25,25 @@ set(MX_Include_Dirs
 
 # STM32CubeMX generated application sources
 set(MX_Application_Src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Attitude/imu_alignment.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Attitude/attitude_estimator.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Attitude/full_range_angles.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../USB_DEVICE/Target/usbd_conf.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../USB_DEVICE/App/usb_device.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../USB_DEVICE/App/usbd_desc.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../USB_DEVICE/App/usbd_cdc_if.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../Attitude/imu_alignment.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../Attitude/attitude_estimator.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../Attitude/full_range_angles.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/main.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/tm_protocol.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/telemetry.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/command_rx.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/telemetry_link.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/display_filter.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/rate_controller.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/dshot.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32h7xx_it.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32h7xx_hal_msp.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/sysmem.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/syscalls.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/Fusion/FusionAhrs.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/Fusion/FusionBias.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/Fusion/FusionCompass.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../startup_stm32h743xx.s
 )
 

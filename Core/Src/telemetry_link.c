@@ -259,6 +259,11 @@ bool TelemetryLink_SendCombinedFast(const TelemetryCombinedFast *combined)
     return false;
   }
 
+  if (payloadLen != TELEMETRY_COMBINED_FAST_PAYLOAD_BYTES)
+  {
+    return false;
+  }
+
   frameLen = TmProtocol_EncodeFrame(TM_FLAG_DIR_FC_TO_HOST,
                                     (uint8_t)TM_PACKET_TYPE_TM_COMBINED_FAST,
                                     payloadLen,

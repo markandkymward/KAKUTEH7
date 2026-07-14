@@ -30,6 +30,7 @@
 #include "usbd_cdc_if.h"
 #include "Fusion.h"
 #include "attitude_estimator.h"
+#include "display_filter.h"
 #include "imu_alignment.h"
 #include "rate_controller.h"
 #include "telemetry_link.h"
@@ -70,17 +71,14 @@
 #define BATTERY_ADC_CHANNEL             ADC_CHANNEL_10
 #define BATTERY_VREF_MV                 3300U
 #define BATTERY_ADC_MAX_COUNTS          4095U
-#define STATUS_LED_PORT                 GPIOC
-#define STATUS_LED_PIN                  GPIO_PIN_2
-#define STATUS_LED_ALT_PORT             GPIOC
-#define STATUS_LED_ALT_PIN              GPIO_PIN_13
-#define STATUS_LED_BLINK_MS             250U
 /* Calibrated from measured 11.34V vs previously reported 14.69V. */
 #define BATTERY_DIVIDER_NUM             849U
 #define BATTERY_DIVIDER_DEN             100U
 
 /* Temporary diagnostic mode: keep only USB bring-up to isolate enumeration issues. */
 #define USB_ENUM_DIAGNOSTIC     0U
+/* Keep verbose text telemetry off by default so the GUI binary stream stays decodable. */
+#define USB_TELEMETRY_TEXT_DEBUG 0U
 
 #define CRSF_FRAME_TYPE_RC_CHANNELS     0x16U
 #define CRSF_SYNC_BYTE                  0xC8U
@@ -157,24 +155,28 @@ TIM_HandleTypeDef htim3;
 
 /* USER CODE BEGIN PV */
 
-volatile int32_t g_roll_cd = 0;
-volatile int32_t g_pitch_cd = 0;
-volatile int32_t g_yaw_cd = 0;
 volatile uint8_t g_imu_found = 0U;
 volatile uint8_t g_imu_bus_id = 0U;
 volatile uint8_t g_imu_whoami = 0U;
 volatile uint32_t g_imu_probe_error = 0U;
 volatile uint32_t g_imu_status = 0U;
+volatile int32_t g_roll_cd = 0;
+volatile int32_t g_pitch_cd = 0;
+volatile int32_t g_yaw_cd = 0;
 volatile int16_t g_gyro_x_raw = 0;
 volatile int16_t g_gyro_y_raw = 0;
 volatile int16_t g_gyro_z_raw = 0;
 volatile int16_t g_accel_x_raw = 0;
 volatile int16_t g_accel_y_raw = 0;
 volatile int16_t g_accel_z_raw = 0;
+
+/* Gyro bias calibration */
 static int32_t g_gyro_bias_x = 0;
 static int32_t g_gyro_bias_y = 0;
 static int32_t g_gyro_bias_z = 0;
 static uint8_t g_gyro_calibrated = 0U;
+
+/* Fused Euler angles from complementary filter */
 static float g_roll_fused = 0.0f;
 static float g_pitch_fused = 0.0f;
 static float g_yaw_fused = 0.0f;
@@ -182,11 +184,19 @@ static float g_q0 = 1.0f;
 static float g_q1 = 0.0f;
 static float g_q2 = 0.0f;
 static float g_q3 = 0.0f;
-static AttitudeEstimator g_attitude_estimator;
-static uint8_t g_imu_spi_mode = 3U;
+static float g_body_accel_x_g = 0.0f;
+static float g_body_accel_y_g = 0.0f;
+static float g_body_accel_z_g = 0.0f;
+static float g_body_down_x = 0.0f;
+static float g_body_down_y = 0.0f;
+static float g_body_down_z = -1.0f;
+static char g_pose_label[48] = "level";
 static float g_gyro_roll_rate_dps = 0.0f;
 static float g_gyro_pitch_rate_dps = 0.0f;
 static float g_gyro_yaw_rate_dps = 0.0f;
+static AttitudeEstimator g_attitude_estimator;
+
+static uint8_t g_imu_spi_mode = 3U; /* 3=mode3, 0=mode0 */
 static uint8_t g_usb_ready = 0U;
 static uint32_t g_telemetry_sequence = 0U;
 
@@ -310,19 +320,17 @@ void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
-static uint8_t MX_SPI4_Init(void);
 static uint8_t MX_ADC1_Init(void);
 static void MX_USART6_UART_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_UART4_Init(void);
 /* USER CODE BEGIN PFP */
+static uint8_t MX_SPI4_Init(void);
 static void Telemetry_SendPacket(int32_t pitch_cd, int32_t roll_cd, int32_t yaw_cd,
                                  int16_t gx_raw, int16_t gy_raw, int16_t gz_raw,
                                  int16_t gx_filtered, int16_t gy_filtered, int16_t gz_filtered,
                                  int16_t ax_raw, int16_t ay_raw, int16_t az_raw,
                                  uint32_t pressure_pa, int32_t altitude_cm);
-static uint8_t BMP280_Init(void);
-static uint8_t BMP280_Update(void);
 static uint8_t IMU_Probe(void);
 static uint8_t IMU_ReadWhoAmI(uint8_t reg, uint8_t *whoami);
 static uint8_t IMU_ReadReg(uint8_t reg, uint8_t *value);
@@ -338,15 +346,15 @@ static void IMU_SpiDelay(void);
 static void IMU_CalibrateGyro(void);
 static void IMU_CalibrateLevel(void);
 static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax, int16_t ay, int16_t az);
-static float Angle_WrapDeg180(float angle_deg);
-static void Attitude_FromQuaternionBetaflight(const FusionQuaternion *q, float *roll_deg, float *pitch_deg, float *yaw_deg);
-static uint8_t IMU_TryBringup(void);
+static uint8_t BMP280_Init(void);
+static uint8_t BMP280_Update(void);
 static void Battery_Update(void);
 static void Battery_SelectAdcChannel(uint8_t channel_index);
 static uint32_t Battery_ReadChannelRaw(uint8_t channel_index, uint8_t *ok);
 static HAL_StatusTypeDef BMP280_ReadRegs(uint8_t reg, uint8_t *data, uint16_t len);
 static HAL_StatusTypeDef BMP280_WriteReg(uint8_t reg, uint8_t value);
 static float BMP280_PressureToAltitudeCm(float pressure_pa, float reference_pressure_pa);
+static uint8_t IMU_TryBringup(void);
 static void CRSF_ProcessUart(void);
 static void CRSF_HandleFrame(const uint8_t *frame, uint8_t frame_len);
 static uint8_t CRSF_CalcCrc(const uint8_t *data, uint8_t len);
@@ -372,6 +380,14 @@ static float MotorControl_ChannelToThrottle(uint16_t us);
 static uint8_t Packet_CalcXorChecksum(uint8_t packet_type, uint8_t payload_len, const uint8_t *payload);
 static uint16_t Parse_DecU16(const char *text, uint16_t *consumed);
 static void Serial_Write(const uint8_t *data, uint16_t len);
+#if (USB_TELEMETRY_TEXT_DEBUG != 0U)
+static void Telemetry_SendPoseText(int16_t gx_sensor,
+                                   int16_t gy_sensor,
+                                   int16_t gz_sensor,
+                                   int16_t ax_sensor,
+                                   int16_t ay_sensor,
+                                   int16_t az_sensor);
+#endif
 
 /* USER CODE END PFP */
 
@@ -487,6 +503,7 @@ static void MotorGui_HandleDisplayFilter(uint16_t cutoff_hz)
   float clamped_hz = MotorControl_ClampF((float)cutoff_hz, 0.0f, 10.0f);
 
   g_display_filter_cutoff_hz = clamped_hz;
+  DisplayFilter_SetCutoffHz(clamped_hz);
 }
 
 static void MotorGui_TryParseAsciiLine(const char *line)
@@ -1135,6 +1152,72 @@ static void MotorControl_UpdateVirtual(void)
   MotorOutput_WriteMicroseconds(g_motor_cmd_us);
 }
 
+#if (USB_TELEMETRY_TEXT_DEBUG != 0U)
+static void Telemetry_SendPoseText(int16_t gx_sensor,
+                                   int16_t gy_sensor,
+                                   int16_t gz_sensor,
+                                   int16_t ax_sensor,
+                                   int16_t ay_sensor,
+                                   int16_t az_sensor)
+{
+  char line[196];
+  int len = snprintf(line,
+                     sizeof(line),
+                     "sensor gx=%d gy=%d gz=%d ax=%d ay=%d az=%d\r\n",
+                     gx_sensor,
+                     gy_sensor,
+                     gz_sensor,
+                     ax_sensor,
+                     ay_sensor,
+                     az_sensor);
+
+  if (len > 0)
+  {
+    Serial_Write((const uint8_t *)line, (uint16_t)len);
+  }
+
+  len = snprintf(line,
+                 sizeof(line),
+                 "body gyro_dps=[%+.2f,%+.2f,%+.2f] accel_g=[%+.3f,%+.3f,%+.3f] down=[%+.3f,%+.3f,%+.3f]\r\n",
+                 g_gyro_roll_rate_dps,
+                 g_gyro_pitch_rate_dps,
+                 g_gyro_yaw_rate_dps,
+                 g_body_accel_x_g,
+                 g_body_accel_y_g,
+                 g_body_accel_z_g,
+                 g_body_down_x,
+                 g_body_down_y,
+                 g_body_down_z);
+
+  if (len > 0)
+  {
+    Serial_Write((const uint8_t *)line, (uint16_t)len);
+  }
+
+  len = snprintf(line,
+                 sizeof(line),
+                 "pose q=[%+.4f,%+.4f,%+.4f,%+.4f] roll_full=%+.2f pitch_full=%+.2f yaw_relative=%+.2f\r\n",
+                 g_q0,
+                 g_q1,
+                 g_q2,
+                 g_q3,
+                 g_roll_fused,
+                 g_pitch_fused,
+                 g_yaw_fused);
+
+  if (len > 0)
+  {
+    Serial_Write((const uint8_t *)line, (uint16_t)len);
+  }
+
+  len = snprintf(line, sizeof(line), "pose_label %s\r\n", g_pose_label);
+  if (len > 0)
+  {
+    Serial_Write((const uint8_t *)line, (uint16_t)len);
+  }
+}
+#endif
+
 /* USER CODE END 0 */
 
 /**
@@ -1188,11 +1271,9 @@ int main(void)
   uint32_t now_ms = 0U;
   uint32_t next_telemetry_ms = 0U;
   uint32_t next_tm_link_ms = 0U;
-  uint32_t next_status_led_toggle_ms = 0U;
 
   RateController_Init(&g_rate_controller);
-  AttitudeEstimator_Init(&g_attitude_estimator, 0.5f, 10.0f, 5.0f);
-  ImuAlignment_Init(IMU_ALIGNMENT);
+  AttitudeEstimator_Init(&g_attitude_estimator);
 
   g_usb_ready = 1U;
 
@@ -1205,7 +1286,6 @@ int main(void)
   next_battery_update_ms = HAL_GetTick();
   next_telemetry_ms = HAL_GetTick();
   next_tm_link_ms = HAL_GetTick();
-  next_status_led_toggle_ms = HAL_GetTick() + STATUS_LED_BLINK_MS;
 
   (void)TelemetryLink_Init(&huart6);
 
@@ -1231,26 +1311,18 @@ int main(void)
 #if (USB_ENUM_DIAGNOSTIC != 0U)
     HAL_Delay(10);
 #else
-  int16_t gyro_x = 0;
-  int16_t gyro_y = 0;
-  int16_t gyro_z = 0;
-  int16_t accel_x = 0;
-  int16_t accel_y = 0;
-  int16_t accel_z = 0;
-  uint8_t sample_valid = 0U;
+    int16_t gyro_x = 0;
+    int16_t gyro_y = 0;
+    int16_t gyro_z = 0;
+    int16_t accel_x = 0;
+    int16_t accel_y = 0;
+    int16_t accel_z = 0;
+    uint8_t sample_valid = 0U;
 
     CRSF_ProcessUart();
     MotorGui_ProcessUsbCommands();
     TelemetryLink_Update();
     now_ms = HAL_GetTick();
-
-    if (now_ms >= next_status_led_toggle_ms)
-    {
-      HAL_GPIO_TogglePin(STATUS_LED_PORT, STATUS_LED_PIN);
-      HAL_GPIO_TogglePin(STATUS_LED_ALT_PORT, STATUS_LED_ALT_PIN);
-      next_status_led_toggle_ms = now_ms + STATUS_LED_BLINK_MS;
-    }
-
     if ((g_rc_last_frame_ms != 0U) && ((now_ms - g_rc_last_frame_ms) <= 100U))
     {
       g_rc_link_ok = 1U;
@@ -1299,11 +1371,11 @@ int main(void)
       next_battery_update_ms = HAL_GetTick() + 100U;
     }
 
-    if (g_imu_found != 0U)
+    if (g_imu_found)
     {
       uint8_t gyro_ok = IMU_ReadRaw(&gyro_x, &gyro_y, &gyro_z);
       uint8_t accel_ok = IMU_ReadAccel(&accel_x, &accel_y, &accel_z);
-      if ((gyro_ok != 0U) && (accel_ok != 0U))
+      if (gyro_ok && accel_ok)
       {
         IMU_UpdateEulerAngles(gyro_x, gyro_y, gyro_z, accel_x, accel_y, accel_z);
         sample_valid = 1U;
@@ -1322,19 +1394,15 @@ int main(void)
       accel_x = 0;
       accel_y = 0;
       accel_z = 0;
-      g_pitch_cd = 0;
-      g_roll_cd = 0;
-      g_yaw_cd = 0;
-      g_q0 = 1.0f;
-      g_q1 = 0.0f;
-      g_q2 = 0.0f;
-      g_q3 = 0.0f;
       g_display_filter_gx = 0;
       g_display_filter_gy = 0;
       g_display_filter_gz = 0;
       g_gyro_roll_rate_dps = 0.0f;
       g_gyro_pitch_rate_dps = 0.0f;
       g_gyro_yaw_rate_dps = 0.0f;
+      g_body_accel_x_g = 0.0f;
+      g_body_accel_y_g = 0.0f;
+      g_body_accel_z_g = 0.0f;
     }
 
     {
@@ -1406,33 +1474,14 @@ int main(void)
       if ((int32_t)(now_ms - next_tm_link_ms) >= 0)
       {
         TelemetryCombinedFast tm_fast;
-        FusionVector sensor_gyro_raw;
-        FusionVector body_gyro_raw;
         memset(&tm_fast, 0, sizeof(tm_fast));
 
         tm_fast.gyroXdps10 = (int16_t)lroundf(g_gyro_roll_rate_dps * 10.0f);
         tm_fast.gyroYdps10 = (int16_t)lroundf(g_gyro_pitch_rate_dps * 10.0f);
         tm_fast.gyroZdps10 = (int16_t)lroundf(g_gyro_yaw_rate_dps * 10.0f);
-        tm_fast.sensorGyroXraw = gyro_x;
-        tm_fast.sensorGyroYraw = gyro_y;
-        tm_fast.sensorGyroZraw = gyro_z;
-        sensor_gyro_raw.axis.x = (float)gyro_x;
-        sensor_gyro_raw.axis.y = (float)gyro_y;
-        sensor_gyro_raw.axis.z = (float)gyro_z;
-        ImuMapGyroSensorToBody(sensor_gyro_raw, &body_gyro_raw);
-        tm_fast.bodyGyroXraw = (int16_t)lroundf(body_gyro_raw.axis.x);
-        tm_fast.bodyGyroYraw = (int16_t)lroundf(body_gyro_raw.axis.y);
-        tm_fast.bodyGyroZraw = (int16_t)lroundf(body_gyro_raw.axis.z);
-        tm_fast.accelXraw = g_accel_x_raw;
-        tm_fast.accelYraw = g_accel_y_raw;
-        tm_fast.accelZraw = g_accel_z_raw;
         tm_fast.rollCd = (int16_t)g_roll_cd;
         tm_fast.pitchCd = (int16_t)g_pitch_cd;
         tm_fast.yawCd = (int16_t)g_yaw_cd;
-        tm_fast.q0x10000 = (int16_t)lroundf(g_q0 * 10000.0f);
-        tm_fast.q1x10000 = (int16_t)lroundf(g_q1 * 10000.0f);
-        tm_fast.q2x10000 = (int16_t)lroundf(g_q2 * 10000.0f);
-        tm_fast.q3x10000 = (int16_t)lroundf(g_q3 * 10000.0f);
 
         tm_fast.rcThrottleUs = g_rc_channels_us[2];
 
@@ -1472,6 +1521,9 @@ int main(void)
                            accel_z,
                            g_baro_pressure_pa,
                            g_baro_altitude_cm);
+#if (USB_TELEMETRY_TEXT_DEBUG != 0U)
+      Telemetry_SendPoseText(gyro_x, gyro_y, gyro_z, accel_x, accel_y, accel_z);
+#endif
       next_telemetry_ms = now_ms + 10U;
     }
 #endif
@@ -1799,7 +1851,7 @@ static uint8_t MX_ADC1_Init(void)
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_ADC12_CLK_ENABLE();
 
-  GPIO_InitStruct.Pin = BATTERY_ADC_PIN;
+  GPIO_InitStruct.Pin = BATTERY_ADC_PIN | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_5;
   GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(BATTERY_ADC_PORT, &GPIO_InitStruct);
@@ -2190,13 +2242,7 @@ static void MX_GPIO_Init(void)
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
-  HAL_GPIO_WritePin(STATUS_LED_ALT_PORT, STATUS_LED_ALT_PIN, GPIO_PIN_RESET);
-  GPIO_InitStruct.Pin = STATUS_LED_ALT_PIN;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(STATUS_LED_ALT_PORT, &GPIO_InitStruct);
-
+  /* IMU bit-banged SPI pins: PE4=CS, PE2=SCK, PE6=MOSI, PE5=MISO */
   HAL_GPIO_WritePin(GPIOE, IMU_CS_PIN, GPIO_PIN_SET);
   HAL_GPIO_WritePin(GPIOE, IMU_SCK_PIN, GPIO_PIN_SET);
   HAL_GPIO_WritePin(GPIOE, IMU_MOSI_PIN, GPIO_PIN_RESET);
@@ -2550,10 +2596,12 @@ static uint8_t BMP280_Update(void)
 
 static uint8_t MX_SPI4_Init(void)
 {
+  /* Bit-banged SPI uses GPIO only; pins are configured in MX_GPIO_Init. */
   g_imu_probe_error = 0U;
   HAL_GPIO_WritePin(IMU_CS_PORT, IMU_CS_PIN, GPIO_PIN_SET);
   HAL_GPIO_WritePin(IMU_SCK_PORT, IMU_SCK_PIN, GPIO_PIN_SET);
   HAL_GPIO_WritePin(IMU_MOSI_PORT, IMU_MOSI_PIN, GPIO_PIN_RESET);
+
   return 1U;
 }
 
@@ -2582,6 +2630,7 @@ static uint8_t IMU_TryBringup(void)
   HAL_Delay(100);
   IMU_CalibrateLevel();
   HAL_Delay(500);
+
   return 1U;
 }
 
@@ -2590,6 +2639,7 @@ static uint8_t IMU_ReadWhoAmI(uint8_t reg, uint8_t *whoami)
   uint8_t valueMode3;
   uint8_t valueMode0;
 
+  /* Try mode 3 first (common for MPU/ICM on FCs), then mode 0 fallback. */
   HAL_GPIO_WritePin(IMU_CS_PORT, IMU_CS_PIN, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(IMU_SCK_PORT, IMU_SCK_PIN, GPIO_PIN_SET);
   (void)IMU_SpiTransferMode3((uint8_t)(reg | 0x80U));
@@ -2616,7 +2666,7 @@ static uint8_t IMU_ReadWhoAmI(uint8_t reg, uint8_t *whoami)
     return 1U;
   }
 
-  g_imu_probe_error = 0xE303U;
+  g_imu_probe_error = 0xE303U; /* no valid SPI response */
   return 0U;
 }
 
@@ -2627,15 +2677,16 @@ static uint8_t IMU_Probe(void)
 
   if (IMU_ReadWhoAmI(IMU_WHOAMI_REG_MPU, &whoami) != 0U)
   {
-    if ((whoami == 0x68U) || (whoami == 0x70U) || (whoami == 0x71U) || (whoami == 0x42U) || (whoami == 0x47U))
+    if ((whoami == 0x68U) || (whoami == 0x70U) || (whoami == 0x71U) ||
+        (whoami == 0x42U) || (whoami == 0x47U))
     {
       if ((IMU_ReadReg(IMU_WHOAMI_REG_MPU, &whoami_verify) == 0U) || (whoami_verify != whoami))
       {
-        g_imu_probe_error = 0xE304U;
+        g_imu_probe_error = 0xE304U; /* unstable WHO_AM_I */
         return 0U;
       }
 
-      g_imu_bus_id = 4U;
+      g_imu_bus_id = 4U; /* bus marker: SPI4 */
       g_imu_whoami = whoami;
       return 1U;
     }
@@ -2645,15 +2696,16 @@ static uint8_t IMU_Probe(void)
   {
     if (whoami == 0x24U)
     {
-      g_imu_probe_error = 0xE320U;
+      g_imu_probe_error = 0xE320U; /* BMI270 detected: current config path supports ICM-class only */
       return 0U;
     }
   }
 
   if (g_imu_probe_error == 0U)
   {
-    g_imu_probe_error = 0xE302U;
+    g_imu_probe_error = 0xE302U; /* SPI responded but WHO_AM_I did not match supported IDs */
   }
+
   return 0U;
 }
 
@@ -2663,8 +2715,11 @@ static uint8_t IMU_SpiTransferMode0(uint8_t tx)
 
   for (uint32_t bit = 0U; bit < 8U; bit++)
   {
-    HAL_GPIO_WritePin(IMU_MOSI_PORT, IMU_MOSI_PIN, ((tx & 0x80U) != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(IMU_MOSI_PORT,
+                      IMU_MOSI_PIN,
+                      ((tx & 0x80U) != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
     tx <<= 1;
+
     IMU_SpiDelay();
     HAL_GPIO_WritePin(IMU_SCK_PORT, IMU_SCK_PIN, GPIO_PIN_SET);
     IMU_SpiDelay();
@@ -2676,31 +2731,6 @@ static uint8_t IMU_SpiTransferMode0(uint8_t tx)
     }
 
     HAL_GPIO_WritePin(IMU_SCK_PORT, IMU_SCK_PIN, GPIO_PIN_RESET);
-  }
-
-  return rx;
-}
-
-static uint8_t IMU_SpiTransferMode3(uint8_t tx)
-{
-  uint8_t rx = 0U;
-
-  for (uint32_t bit = 0U; bit < 8U; bit++)
-  {
-    HAL_GPIO_WritePin(IMU_MOSI_PORT, IMU_MOSI_PIN, ((tx & 0x80U) != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    tx <<= 1;
-
-    HAL_GPIO_WritePin(IMU_SCK_PORT, IMU_SCK_PIN, GPIO_PIN_RESET);
-    IMU_SpiDelay();
-
-    HAL_GPIO_WritePin(IMU_SCK_PORT, IMU_SCK_PIN, GPIO_PIN_SET);
-    IMU_SpiDelay();
-
-    rx <<= 1;
-    if (HAL_GPIO_ReadPin(IMU_MISO_PORT, IMU_MISO_PIN) == GPIO_PIN_SET)
-    {
-      rx |= 1U;
-    }
   }
 
   return rx;
@@ -2712,6 +2742,7 @@ static uint8_t IMU_SpiTransfer(uint8_t tx)
   {
     return IMU_SpiTransferMode0(tx);
   }
+
   return IMU_SpiTransferMode3(tx);
 }
 
@@ -2726,6 +2757,7 @@ static uint8_t IMU_ReadReg(uint8_t reg, uint8_t *value)
   {
     return 0U;
   }
+
   return 1U;
 }
 
@@ -2746,18 +2778,19 @@ static uint8_t IMU_ReadBurst(uint8_t startReg, uint8_t *data, uint8_t len)
   }
 
   HAL_GPIO_WritePin(IMU_CS_PORT, IMU_CS_PIN, GPIO_PIN_RESET);
-  IMU_SpiDelay();
+  IMU_SpiDelay();  /* Ensure CS is settled before first transfer */
+  
   (void)IMU_SpiTransfer((uint8_t)(startReg | 0x80U));
-  IMU_SpiDelay();
+  IMU_SpiDelay();  /* Allow IMU to respond */
 
   for (uint8_t i = 0U; i < len; i++)
   {
     data[i] = IMU_SpiTransfer(0x00U);
-    IMU_SpiDelay();
+    IMU_SpiDelay();  /* Brief delay between bytes */
   }
 
   HAL_GPIO_WritePin(IMU_CS_PORT, IMU_CS_PIN, GPIO_PIN_SET);
-  IMU_SpiDelay();
+  IMU_SpiDelay();  /* Ensure CS is settled before release */
   return 1U;
 }
 
@@ -2765,10 +2798,10 @@ static uint8_t IMU_Config(void)
 {
   uint8_t verify = 0U;
 
-  (void)IMU_WriteReg(IMU_REG_PWR_MGMT0, 0x0FU);
+  (void)IMU_WriteReg(IMU_REG_PWR_MGMT0, 0x0FU);    /* accel+gyro LN mode */
   HAL_Delay(2U);
-  (void)IMU_WriteReg(IMU_REG_GYRO_CONFIG0, 0x06U);
-  (void)IMU_WriteReg(IMU_REG_ACCEL_CONFIG0, 0x06U);
+  (void)IMU_WriteReg(IMU_REG_GYRO_CONFIG0, 0x06U); /* 2000dps, 1kHz */
+  (void)IMU_WriteReg(IMU_REG_ACCEL_CONFIG0, 0x06U);/* 16g, 1kHz */
   HAL_Delay(2U);
 
   if (IMU_ReadReg(IMU_REG_PWR_MGMT0, &verify) == 0U)
@@ -2786,18 +2819,17 @@ static uint8_t IMU_Config(void)
   return 1U;
 }
 
+/**
+ * @brief Calibrate gyro by averaging 100 readings while board is stationary
+ */
 static void IMU_CalibrateGyro(void)
 {
-  int32_t sum_gx = 0;
-  int32_t sum_gy = 0;
-  int32_t sum_gz = 0;
-  int16_t gx;
-  int16_t gy;
-  int16_t gz;
-
+  int32_t sum_gx = 0, sum_gy = 0, sum_gz = 0;
+  int16_t gx, gy, gz;
+  
   for (int i = 0; i < 100; i++)
   {
-    if (IMU_ReadRaw(&gx, &gy, &gz) != 0U)
+    if (IMU_ReadRaw(&gx, &gy, &gz))
     {
       sum_gx += gx;
       sum_gy += gy;
@@ -2805,16 +2837,20 @@ static void IMU_CalibrateGyro(void)
     }
     HAL_Delay(10);
   }
-
+  
   g_gyro_bias_x = sum_gx / 100;
   g_gyro_bias_y = sum_gy / 100;
   g_gyro_bias_z = sum_gz / 100;
   g_gyro_calibrated = 1U;
 }
 
+/**
+ * @brief Calibrate level position (initialize pitch/roll from accel)
+ * Reads accel for ~1 second on level surface to establish baseline angles
+ */
 static void IMU_CalibrateLevel(void)
 {
-  AttitudeEstimator_Init(&g_attitude_estimator, 0.5f, 10.0f, 5.0f);
+  AttitudeEstimator_Reset(&g_attitude_estimator);
   g_roll_fused = 0.0f;
   g_pitch_fused = 0.0f;
   g_yaw_fused = 0.0f;
@@ -2822,18 +2858,22 @@ static void IMU_CalibrateLevel(void)
   g_q1 = 0.0f;
   g_q2 = 0.0f;
   g_q3 = 0.0f;
+  g_body_down_x = 0.0f;
+  g_body_down_y = 0.0f;
+  g_body_down_z = -1.0f;
+  (void)strcpy(g_pose_label, "level");
 }
 
+/**
+ * @brief Update Euler angles using complementary filter
+ * Combines accelerometer (absolute reference) with gyro (fast response)
+ */
 static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax, int16_t ay, int16_t az)
 {
   static uint32_t s_last_update_ms = 0U;
+  const AttitudeEstimate *estimate;
   uint32_t now_ms = HAL_GetTick();
   float dt = 0.01f;
-  FusionVector gyro_vector;
-  FusionVector accel_vector;
-  FusionVector gyro_body;
-  FusionVector accel_body;
-  const AttitudeState *state;
 
   if (s_last_update_ms != 0U)
   {
@@ -2857,76 +2897,68 @@ static void IMU_UpdateEulerAngles(int16_t gx, int16_t gy, int16_t gz, int16_t ax
   }
   s_last_update_ms = now_ms;
 
-  g_display_filter_gx = gx;
-  g_display_filter_gy = gy;
-  g_display_filter_gz = gz;
+  DisplayFilter_ProcessGyro(dt, gx, gy, gz, &g_display_filter_gx, &g_display_filter_gy, &g_display_filter_gz);
 
-  gyro_vector.axis.x = ((float)(gx - (int16_t)g_gyro_bias_x)) * IMU_GYRO_DPS_PER_LSB;
-  gyro_vector.axis.y = ((float)(gy - (int16_t)g_gyro_bias_y)) * IMU_GYRO_DPS_PER_LSB;
-  gyro_vector.axis.z = ((float)(gz - (int16_t)g_gyro_bias_z)) * IMU_GYRO_DPS_PER_LSB;
+  /* Apply gyro bias correction */
+  int16_t gx_corrected = gx - (int16_t)g_gyro_bias_x;
+  int16_t gy_corrected = gy - (int16_t)g_gyro_bias_y;
+  int16_t gz_corrected = gz - (int16_t)g_gyro_bias_z;
+  
+  /* Convert gyro to degrees/sec (2000 dps range) */
+  float gx_dps = (float)gx_corrected * IMU_GYRO_DPS_PER_LSB;
+  float gy_dps = (float)gy_corrected * IMU_GYRO_DPS_PER_LSB;
+  float gz_dps = (float)gz_corrected * IMU_GYRO_DPS_PER_LSB;
+  float gx_body = 0.0f;
+  float gy_body = 0.0f;
+  float gz_body = 0.0f;
+  
+  /* Convert accel to g units (±16g range) */
+  float ax_g = (float)ax / IMU_ACCEL_LSB_PER_G;
+  float ay_g = (float)ay / IMU_ACCEL_LSB_PER_G;
+  float az_g = (float)az / IMU_ACCEL_LSB_PER_G;
+  float ax_body = 0.0f;
+  float ay_body = 0.0f;
+  float az_body = 0.0f;
+  FusionVector gyro_vector;
+  FusionVector accel_vector;
 
-  accel_vector.axis.x = (float)ax / IMU_ACCEL_LSB_PER_G;
-  accel_vector.axis.y = (float)ay / IMU_ACCEL_LSB_PER_G;
-  accel_vector.axis.z = (float)az / IMU_ACCEL_LSB_PER_G;
+  ImuAlignmentSensorToBodyAxes(gx_dps, gy_dps, gz_dps, &gx_body, &gy_body, &gz_body);
+  ImuAlignmentSensorToBodyAxes(ax_g, ay_g, az_g, &ax_body, &ay_body, &az_body);
 
-  ImuMapGyroSensorToBody(gyro_vector, &gyro_body);
-  ImuMapAccelSensorToBody(accel_vector, &accel_body);
+  g_gyro_roll_rate_dps = gx_body;
+  g_gyro_pitch_rate_dps = gy_body;
+  g_gyro_yaw_rate_dps = gz_body;
+  g_body_accel_x_g = ax_body;
+  g_body_accel_y_g = ay_body;
+  g_body_accel_z_g = az_body;
 
-  g_gyro_roll_rate_dps = gyro_body.axis.x;
-  g_gyro_pitch_rate_dps = gyro_body.axis.y;
-  g_gyro_yaw_rate_dps = gyro_body.axis.z;
+  gyro_vector.axis.x = gx_body;
+  gyro_vector.axis.y = gy_body;
+  gyro_vector.axis.z = gz_body;
 
-  (void)AttitudeEstimator_Update(&g_attitude_estimator, gyro_body, accel_body, dt);
-  state = AttitudeEstimator_GetState(&g_attitude_estimator);
-  if ((state == NULL) || (state->valid == false))
+  accel_vector.axis.x = ax_body;
+  accel_vector.axis.y = ay_body;
+  accel_vector.axis.z = az_body;
+
+  AttitudeEstimator_Update(&g_attitude_estimator, dt, gyro_vector, accel_vector);
+  estimate = AttitudeEstimator_GetEstimate(&g_attitude_estimator);
+  if (estimate == NULL)
   {
     return;
   }
 
-  g_q0 = state->quaternion.element.w;
-  g_q1 = state->quaternion.element.x;
-  g_q2 = state->quaternion.element.y;
-  g_q3 = state->quaternion.element.z;
-  Attitude_FromQuaternionBetaflight(&state->quaternion, &g_roll_fused, &g_pitch_fused, &g_yaw_fused);
-}
-
-static float Angle_WrapDeg180(float angle_deg)
-{
-  while (angle_deg > 180.0f)
-  {
-    angle_deg -= 360.0f;
-  }
-  while (angle_deg < -180.0f)
-  {
-    angle_deg += 360.0f;
-  }
-  return angle_deg;
-}
-
-static void Attitude_FromQuaternionBetaflight(const FusionQuaternion *q, float *roll_deg, float *pitch_deg, float *yaw_deg)
-{
-  const float qw = q->element.w;
-  const float qx = q->element.x;
-  const float qy = q->element.y;
-  const float qz = q->element.z;
-
-  const float sin_pitch = 2.0f * ((qw * qy) - (qz * qx));
-  float clamped_sin_pitch = sin_pitch;
-  if (clamped_sin_pitch > 1.0f)
-  {
-    clamped_sin_pitch = 1.0f;
-  }
-  else if (clamped_sin_pitch < -1.0f)
-  {
-    clamped_sin_pitch = -1.0f;
-  }
-
-  *roll_deg = atan2f(2.0f * ((qw * qx) + (qy * qz)),
-                     1.0f - (2.0f * ((qx * qx) + (qy * qy)))) * (180.0f / (float)M_PI);
-  *pitch_deg = asinf(clamped_sin_pitch) * (180.0f / (float)M_PI);
-  *yaw_deg = Angle_WrapDeg180(
-      atan2f(2.0f * ((qw * qz) + (qx * qy)),
-             1.0f - (2.0f * ((qy * qy) + (qz * qz)))) * (180.0f / (float)M_PI));
+  g_q0 = estimate->quaternion.element.w;
+  g_q1 = estimate->quaternion.element.x;
+  g_q2 = estimate->quaternion.element.y;
+  g_q3 = estimate->quaternion.element.z;
+  g_roll_fused = estimate->rollDeg;
+  g_pitch_fused = estimate->pitchDeg;
+  g_yaw_fused = estimate->yawRelativeDeg;
+  g_body_down_x = estimate->bodyDown.axis.x;
+  g_body_down_y = estimate->bodyDown.axis.y;
+  g_body_down_z = estimate->bodyDown.axis.z;
+  (void)strncpy(g_pose_label, estimate->poseLabel, sizeof(g_pose_label) - 1U);
+  g_pose_label[sizeof(g_pose_label) - 1U] = '\0';
 }
 
 static uint8_t IMU_ReadRaw(int16_t *gx, int16_t *gy, int16_t *gz)
@@ -2938,18 +2970,17 @@ static uint8_t IMU_ReadRaw(int16_t *gx, int16_t *gy, int16_t *gz)
     return 0U;
   }
 
+  /* Read gyro data only (starting at register 0x25, 6 bytes: GX, GY, GZ) */
   if (IMU_ReadBurst(0x25U, data, (uint8_t)sizeof(data)) == 0U)
   {
     g_imu_probe_error = 0xE307U;
     return 0U;
   }
 
+  /* BMI270 uses big-endian: high byte first, then low byte */
   *gx = (int16_t)((((uint16_t)data[0]) << 8) | (uint16_t)data[1]);
   *gy = (int16_t)((((uint16_t)data[2]) << 8) | (uint16_t)data[3]);
   *gz = (int16_t)((((uint16_t)data[4]) << 8) | (uint16_t)data[5]);
-  g_gyro_x_raw = *gx;
-  g_gyro_y_raw = *gy;
-  g_gyro_z_raw = *gz;
   return 1U;
 }
 
@@ -2962,22 +2993,50 @@ static uint8_t IMU_ReadAccel(int16_t *ax, int16_t *ay, int16_t *az)
     return 0U;
   }
 
+  /* Read accel data (register 0x1F, 6 bytes: AX, AY, AZ) */
   if (IMU_ReadBurst(0x1FU, data, (uint8_t)sizeof(data)) == 0U)
   {
     return 0U;
   }
 
+  /* BMI270 uses big-endian: high byte first, then low byte */
   *ax = (int16_t)((((uint16_t)data[0]) << 8) | (uint16_t)data[1]);
   *ay = (int16_t)((((uint16_t)data[2]) << 8) | (uint16_t)data[3]);
   *az = (int16_t)((((uint16_t)data[4]) << 8) | (uint16_t)data[5]);
-  g_accel_x_raw = *ax;
-  g_accel_y_raw = *ay;
-  g_accel_z_raw = *az;
   return 1U;
+}
+
+static uint8_t IMU_SpiTransferMode3(uint8_t tx)
+{
+  uint8_t rx = 0U;
+
+  for (uint32_t bit = 0U; bit < 8U; bit++)
+  {
+    /* CPOL=1, CPHA=1: change on falling edge, sample on rising edge. */
+    HAL_GPIO_WritePin(IMU_MOSI_PORT,
+                      IMU_MOSI_PIN,
+                      ((tx & 0x80U) != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    tx <<= 1;
+
+    HAL_GPIO_WritePin(IMU_SCK_PORT, IMU_SCK_PIN, GPIO_PIN_RESET);
+    IMU_SpiDelay();
+
+    HAL_GPIO_WritePin(IMU_SCK_PORT, IMU_SCK_PIN, GPIO_PIN_SET);
+    IMU_SpiDelay();
+
+    rx <<= 1;
+    if (HAL_GPIO_ReadPin(IMU_MISO_PORT, IMU_MISO_PIN) == GPIO_PIN_SET)
+    {
+      rx |= 1U;
+    }
+  }
+
+  return rx;
 }
 
 static void IMU_SpiDelay(void)
 {
+  /* Provide ~1 microsecond delay (10 NOPs was too fast at 120 MHz) */
   for (volatile uint32_t i = 0U; i < 1000U; i++)
   {
     __NOP();

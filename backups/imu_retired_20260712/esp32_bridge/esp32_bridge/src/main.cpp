@@ -25,7 +25,6 @@ constexpr uint32_t kUartBaud = 420000;
 constexpr size_t kFcToTcpRingSize = 8192;
 constexpr size_t kTcpToFcRingSize = 8192;
 constexpr size_t kIoChunk = 256;
-constexpr size_t kTmMaxFrameBytes = 14 + 192 + 2;
 
 class ByteRing {
  public:
@@ -67,111 +66,7 @@ struct BridgeCounters {
   uint64_t bytesLaptopToFc = 0;
   uint32_t uartOverflowCount = 0;
   uint32_t tcpWriteFailureCount = 0;
-  uint32_t tmCandidateCount = 0;
-  uint32_t tmValidCount = 0;
-  uint32_t tmType06Len54 = 0;
-  uint32_t tmType06Len80 = 0;
-  uint32_t tmOtherValid = 0;
 };
-
-BridgeCounters counters;
-
-uint8_t tmFrameBuf[kTmMaxFrameBytes];
-size_t tmFrameIndex = 0;
-size_t tmFrameTarget = 0;
-
-uint16_t crc16Ccitt(const uint8_t *data, size_t len) {
-  uint16_t crc = 0xFFFF;
-  if (data == nullptr) {
-    return crc;
-  }
-  for (size_t i = 0; i < len; i++) {
-    crc ^= static_cast<uint16_t>(data[i]) << 8;
-    for (uint8_t bit = 0; bit < 8; bit++) {
-      if ((crc & 0x8000U) != 0U) {
-        crc = static_cast<uint16_t>((crc << 1U) ^ 0x1021U);
-      } else {
-        crc = static_cast<uint16_t>(crc << 1U);
-      }
-    }
-  }
-  return crc;
-}
-
-void observeFcBytes(const uint8_t *src, size_t len) {
-  if (src == nullptr || len == 0) {
-    return;
-  }
-
-  for (size_t i = 0; i < len; i++) {
-    const uint8_t byte = src[i];
-
-    if (tmFrameIndex == 0) {
-      if (byte == 0xA5U) {
-        tmFrameBuf[0] = byte;
-        tmFrameIndex = 1;
-      }
-      continue;
-    }
-
-    if (tmFrameIndex == 1) {
-      if (byte == 0x5AU) {
-        tmFrameBuf[1] = byte;
-        tmFrameIndex = 2;
-      } else if (byte == 0xA5U) {
-        tmFrameBuf[0] = byte;
-        tmFrameIndex = 1;
-      } else {
-        tmFrameIndex = 0;
-      }
-      continue;
-    }
-
-    if (tmFrameIndex >= kTmMaxFrameBytes) {
-      tmFrameIndex = 0;
-      tmFrameTarget = 0;
-      continue;
-    }
-
-    tmFrameBuf[tmFrameIndex++] = byte;
-
-    if (tmFrameIndex == 14) {
-      const uint16_t payloadLen = static_cast<uint16_t>(tmFrameBuf[5])
-                                | (static_cast<uint16_t>(tmFrameBuf[6]) << 8);
-      if (payloadLen > 192U) {
-        tmFrameIndex = 0;
-        tmFrameTarget = 0;
-        continue;
-      }
-      tmFrameTarget = static_cast<size_t>(14U + payloadLen + 2U);
-      counters.tmCandidateCount++;
-    }
-
-    if ((tmFrameTarget != 0U) && (tmFrameIndex >= tmFrameTarget)) {
-      const uint16_t payloadLen = static_cast<uint16_t>(tmFrameBuf[5])
-                                | (static_cast<uint16_t>(tmFrameBuf[6]) << 8);
-      const uint8_t packetType = tmFrameBuf[4];
-      const size_t crcPos = static_cast<size_t>(14U + payloadLen);
-      const uint16_t rxCrc = static_cast<uint16_t>(tmFrameBuf[crcPos])
-                           | (static_cast<uint16_t>(tmFrameBuf[crcPos + 1U]) << 8);
-      const uint16_t calcCrc = crc16Ccitt(&tmFrameBuf[2], static_cast<size_t>(12U + payloadLen));
-
-      if (rxCrc == calcCrc) {
-        counters.tmValidCount++;
-        if (packetType == 0x06U && payloadLen == 54U) {
-          counters.tmType06Len54++;
-        } else if (packetType == 0x06U && payloadLen == 80U) {
-          counters.tmType06Len80++;
-        } else {
-          counters.tmOtherValid++;
-        }
-      }
-
-      tmFrameIndex = 0;
-      tmFrameTarget = 0;
-    }
-  }
-}
 
 HardwareSerial fcUart(1);
 WiFiServer tcpServer(kTcpPort);
@@ -182,6 +77,7 @@ uint8_t tcpToFcStorage[kTcpToFcRingSize];
 ByteRing fcToTcp(fcToTcpStorage, kFcToTcpRingSize);
 ByteRing tcpToFc(tcpToFcStorage, kTcpToFcRingSize);
 
+BridgeCounters counters;
 unsigned long lastStatusMs = 0;
 bool hadClient = false;
 
@@ -248,8 +144,6 @@ void readFromFcUart() {
     if (got == 0) {
       break;
     }
-
-    observeFcBytes(buf, got);
 
     size_t pushed = fcToTcp.push(buf, got);
     if (pushed < got) {
@@ -341,18 +235,13 @@ void printPeriodicStatus() {
   }
 
   Serial.printf(
-      "[bridge] FC->Laptop=%llu bytes, Laptop->FC=%llu bytes, UART_overflow=%lu, TCP_write_fail=%lu, q_fc2tcp=%u, q_tcp2fc=%u, tm_cand=%lu, tm_ok=%lu, tm06_54=%lu, tm06_80=%lu, tm_other=%lu\n",
+      "[bridge] FC->Laptop=%llu bytes, Laptop->FC=%llu bytes, UART_overflow=%lu, TCP_write_fail=%lu, q_fc2tcp=%u, q_tcp2fc=%u\n",
       static_cast<unsigned long long>(counters.bytesFcToLaptop),
       static_cast<unsigned long long>(counters.bytesLaptopToFc),
       static_cast<unsigned long>(counters.uartOverflowCount),
       static_cast<unsigned long>(counters.tcpWriteFailureCount),
       static_cast<unsigned>(fcToTcp.size()),
-      static_cast<unsigned>(tcpToFc.size()),
-      static_cast<unsigned long>(counters.tmCandidateCount),
-      static_cast<unsigned long>(counters.tmValidCount),
-      static_cast<unsigned long>(counters.tmType06Len54),
-      static_cast<unsigned long>(counters.tmType06Len80),
-      static_cast<unsigned long>(counters.tmOtherValid));
+      static_cast<unsigned>(tcpToFc.size()));
 }
 
 }  // namespace

@@ -1,20 +1,19 @@
 {
-  "schema": 2,
-  "geometry": "1920x1057+-900+-1088",
+  "schema": 3,
+  "geometry": "1920x1048+-902+-1080",
   "panes": {
     "root_stack": [
-      280,
-      597
+      466
     ],
     "top_row": [
-      645,
-      1252
+      408,
+      700
     ],
     "bottom_row": [
-      419
+      969
     ],
     "controls_and_motors": [
-      186
+      175
     ]
   }
 }

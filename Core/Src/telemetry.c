@@ -2,6 +2,11 @@
 
 #include <string.h>
 
+_Static_assert(TELEMETRY_COMBINED_FAST_PAYLOAD_BYTES == 80U,
+               "TELEMETRY_COMBINED_FAST_PAYLOAD_BYTES must be 80 bytes");
+_Static_assert(sizeof(TelemetryCombinedFast) == TELEMETRY_COMBINED_FAST_PAYLOAD_BYTES,
+               "TelemetryCombinedFast struct size must match TM payload size");
+
 #define TELEMETRY_COMMAND_REPLY_PAYLOAD_BYTES 8U
 
 static void telemetry_put_u16_le(uint8_t *dst, uint16_t value)
@@ -55,9 +60,22 @@ uint16_t Telemetry_PackCombinedFast(const TelemetryCombinedFast *src,
   telemetry_put_s16_le(&dst[index], src->gyroXdps10); index += 2U;
   telemetry_put_s16_le(&dst[index], src->gyroYdps10); index += 2U;
   telemetry_put_s16_le(&dst[index], src->gyroZdps10); index += 2U;
+  telemetry_put_s16_le(&dst[index], src->sensorGyroXraw); index += 2U;
+  telemetry_put_s16_le(&dst[index], src->sensorGyroYraw); index += 2U;
+  telemetry_put_s16_le(&dst[index], src->sensorGyroZraw); index += 2U;
+  telemetry_put_s16_le(&dst[index], src->bodyGyroXraw); index += 2U;
+  telemetry_put_s16_le(&dst[index], src->bodyGyroYraw); index += 2U;
+  telemetry_put_s16_le(&dst[index], src->bodyGyroZraw); index += 2U;
+  telemetry_put_s16_le(&dst[index], src->accelXraw); index += 2U;
+  telemetry_put_s16_le(&dst[index], src->accelYraw); index += 2U;
+  telemetry_put_s16_le(&dst[index], src->accelZraw); index += 2U;
   telemetry_put_s16_le(&dst[index], src->rollCd); index += 2U;
   telemetry_put_s16_le(&dst[index], src->pitchCd); index += 2U;
   telemetry_put_s16_le(&dst[index], src->yawCd); index += 2U;
+  telemetry_put_s16_le(&dst[index], src->q0x10000); index += 2U;
+  telemetry_put_s16_le(&dst[index], src->q1x10000); index += 2U;
+  telemetry_put_s16_le(&dst[index], src->q2x10000); index += 2U;
+  telemetry_put_s16_le(&dst[index], src->q3x10000); index += 2U;
 
   telemetry_put_u16_le(&dst[index], src->rcThrottleUs); index += 2U;
   telemetry_put_u16_le(&dst[index], src->rcRollUs); index += 2U;
@@ -99,9 +117,22 @@ bool Telemetry_UnpackCombinedFast(const uint8_t *src,
   dst->gyroXdps10 = telemetry_read_s16_le(&src[index]); index += 2U;
   dst->gyroYdps10 = telemetry_read_s16_le(&src[index]); index += 2U;
   dst->gyroZdps10 = telemetry_read_s16_le(&src[index]); index += 2U;
+  dst->sensorGyroXraw = telemetry_read_s16_le(&src[index]); index += 2U;
+  dst->sensorGyroYraw = telemetry_read_s16_le(&src[index]); index += 2U;
+  dst->sensorGyroZraw = telemetry_read_s16_le(&src[index]); index += 2U;
+  dst->bodyGyroXraw = telemetry_read_s16_le(&src[index]); index += 2U;
+  dst->bodyGyroYraw = telemetry_read_s16_le(&src[index]); index += 2U;
+  dst->bodyGyroZraw = telemetry_read_s16_le(&src[index]); index += 2U;
+  dst->accelXraw = telemetry_read_s16_le(&src[index]); index += 2U;
+  dst->accelYraw = telemetry_read_s16_le(&src[index]); index += 2U;
+  dst->accelZraw = telemetry_read_s16_le(&src[index]); index += 2U;
   dst->rollCd = telemetry_read_s16_le(&src[index]); index += 2U;
   dst->pitchCd = telemetry_read_s16_le(&src[index]); index += 2U;
   dst->yawCd = telemetry_read_s16_le(&src[index]); index += 2U;
+  dst->q0x10000 = telemetry_read_s16_le(&src[index]); index += 2U;
+  dst->q1x10000 = telemetry_read_s16_le(&src[index]); index += 2U;
+  dst->q2x10000 = telemetry_read_s16_le(&src[index]); index += 2U;
+  dst->q3x10000 = telemetry_read_s16_le(&src[index]); index += 2U;
 
   dst->rcThrottleUs = telemetry_read_u16_le(&src[index]); index += 2U;
   dst->rcRollUs = telemetry_read_u16_le(&src[index]); index += 2U;

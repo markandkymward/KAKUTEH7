@@ -1,532 +1,604 @@
 {
-    "version": "2.0.0",
-    "tasks": [
-        {
-            "label": "Debug Link Check (Fast Fail)",
-            "type": "process",
-            "command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
-            "args": [
-                "-c", "port=SWD", "freq=200", "mode=HOTPLUG"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "problemMatcher": []
-        },
-        {
-            "label": "Debug Preflight (Prompt DFU On Fail)",
-            "type": "process",
-            "command": "powershell",
-            "args": [
-                "-NoProfile",
-                "-Command",
-                "& 'C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe' -c port=SWD freq=200 mode=HOTPLUG *> $null; if ($LASTEXITCODE -eq 0) { Write-Output 'SWD link OK (200 kHz hot-plug).'; exit 0 } else { Write-Output 'SWD link failed. Please switch the board to DFU mode, then run task: Flash ELF (USB DFU).'; exit 1 }"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "problemMatcher": []
-        },
-        {
-            "label": "Start ST-LINK GDB Server (Manual)",
-            "type": "process",
-            "command": "powershell",
-            "args": [
-                "-NoProfile",
-                "-Command",
-                "$cli='C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe'; $bad='No STM32 target found|Unable to get core ID|Error: No STM32 target found|Error: Unable to get core ID'; $out1 = (& $cli -c port=SWD freq=200 mode=HOTPLUG 2>&1 | Out-String); $ok1 = ($LASTEXITCODE -eq 0) -and ($out1 -notmatch $bad); if (-not $ok1) { Write-Output 'Cannot start gdbserver: target not visible over SWD at 200 kHz hot-plug.'; exit 1 }; Get-Process -Name 'ST-LINK_gdbserver','arm-none-eabi-gdb' -ErrorAction SilentlyContinue | Stop-Process -Force; & 'C:\\Users\\marka\\AppData\\Local\\stm32cube\\bundles\\stlink-gdbserver\\7.13.0+st.3\\bin\\ST-LINK_gdbserver.exe' -c '${workspaceFolder}\\.vscode\\stlink-gdbserver.cfg'"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "problemMatcher": []
-        },
-        {
-            "label": "Build Debug",
-            "type": "shell",
-            "command": "cmd",
-            "args": [
-                "/C",
-                "set PATH=C:\\Users\\marka\\AppData\\Local\\stm32cube\\bundles\\gnu-tools-for-stm32\\14.3.1+st.2\\bin;C:\\Users\\marka\\AppData\\Local\\stm32cube\\bundles\\ninja\\1.13.2+st.1\\bin;%PATH% && ninja -C build/Debug && arm-none-eabi-objcopy -O ihex build\\Debug\\KAKUTEH7.elf build\\Debug\\KAKUTEH7.hex"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "group": {
-                "kind": "build",
-                "isDefault": false
-            },
-            "problemMatcher": {
-                "owner": "gcc",
-                "pattern": {
-                    "regexp": "^(.*):(\\d+):(\\d+):\\s+(warning|error):\\s+(.*)$",
-                    "file": 1,
-                    "line": 2,
-                    "column": 3,
-                    "severity": 4,
-                    "message": 5
-                }
-            }
-        },
-        {
-            "label": "Configure & Build Debug",
-            "type": "shell",
-            "command": "cmd",
-            "args": [
-                "/C",
-                "set PATH=C:\\Users\\marka\\AppData\\Local\\stm32cube\\bundles\\gnu-tools-for-stm32\\14.3.1+st.2\\bin;C:\\Users\\marka\\AppData\\Local\\stm32cube\\bundles\\ninja\\1.13.2+st.1\\bin;C:\\Program Files\\CMake\\bin;%PATH% && cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_TOOLCHAIN_FILE=cmake/gcc-arm-none-eabi.cmake -DCMAKE_SYSTEM_NAME=Generic -DCMAKE_SYSTEM_PROCESSOR=arm -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY -B build/Debug -S . && ninja -C build/Debug && arm-none-eabi-objcopy -O ihex build\\Debug\\KAKUTEH7.elf build\\Debug\\KAKUTEH7.hex"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Flash via SWD",
-            "type": "process",
-            "command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
-            "args": [
-                "-c", "port=SWD", "freq=200", "mode=HOTPLUG",
-                "-d", "${workspaceFolder}\\build\\Debug\\KAKUTEH7.elf"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Flash via SWD (Auto Retry Once)",
-            "type": "process",
-            "command": "powershell",
-            "args": [
-                "-NoProfile",
-                "-Command",
-                "$cli='C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe'; $elf='${workspaceFolder}\\build\\Debug\\KAKUTEH7.elf'; function TestLink { & $cli -c port=SWD freq=200 mode=HOTPLUG *> $null; return ($LASTEXITCODE -eq 0) }; function FlashElf { & $cli -c port=SWD freq=200 mode=HOTPLUG -d $elf; return ($LASTEXITCODE -eq 0) }; if (TestLink -and FlashElf) { Write-Output 'SWD flash succeeded on first attempt.'; exit 0 }; Write-Output 'First SWD flash attempt failed.'; Write-Output 'Power-cycle the board now, then press Enter to retry once.'; Read-Host | Out-Null; if (TestLink -and FlashElf) { Write-Output 'SWD flash succeeded on second attempt.'; exit 0 }; Write-Output 'SWD flash failed after retry.'; exit 1"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Prompt: Power-Cycle Then Flash SWD",
-            "type": "shell",
-            "command": "cmd",
-            "args": [
-                "/C",
-                "echo Build complete. Power-cycle/reset the board now, then press any key to continue SWD flash. & pause"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "problemMatcher": []
-        },
-        {
-            "label": "One Click: Build + Reset Prompt + SWD Flash",
-            "dependsOrder": "sequence",
-            "dependsOn": [
-                "Build Debug",
-                "Prompt: Power-Cycle Then Flash SWD",
-                "Flash via SWD (Auto Retry Once)"
-            ],
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Flash ELF via SWD (Recovery)",
-            "type": "process",
-            "command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
-            "args": [
-                "-c", "port=SWD", "freq=200", "mode=HOTPLUG",
-                "-d", "${workspaceFolder}\\build\\Debug\\KAKUTEH7.elf"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Erase Sector0 then Flash ELF (Recovery)",
-            "type": "process",
-            "command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
-            "args": [
-                "-c", "port=SWD", "freq=200", "mode=HOTPLUG",
-                "-e", "[0 0]",
-                "-d", "${workspaceFolder}\\build\\Debug\\KAKUTEH7.elf"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Connect SWD Only (No Flash)",
-            "type": "process",
-            "command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
-            "args": [
-                "-c", "port=SWD", "freq=200", "mode=HOTPLUG"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Prime SWD HOTPLUG #1",
-            "type": "process",
-            "command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
-            "args": [
-                "-c", "port=SWD", "freq=200", "mode=HOTPLUG"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "problemMatcher": []
-        },
-        {
-            "label": "Prime SWD HOTPLUG #2",
-            "type": "process",
-            "command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
-            "args": [
-                "-c", "port=SWD", "freq=200", "mode=HOTPLUG"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "problemMatcher": []
-        },
-        {
-            "label": "Prime SWD (Double Connect)",
-            "dependsOrder": "sequence",
-            "dependsOn": [
-                "Prime SWD HOTPLUG #1",
-                "Prime SWD HOTPLUG #2"
-            ],
-            "problemMatcher": []
-        },
-        {
-            "label": "Prime SWD #1",
-            "type": "process",
-            "command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
-            "args": [
-                "-c", "port=SWD", "freq=200", "mode=HOTPLUG"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "problemMatcher": []
-        },
-        {
-            "label": "Prime SWD #2",
-            "type": "process",
-            "command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
-            "args": [
-                "-c", "port=SWD", "freq=200", "mode=HOTPLUG"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "problemMatcher": []
-        },
-        {
-            "label": "Prime SWD (x2)",
-            "dependsOrder": "sequence",
-            "dependsOn": [
-                "Prime SWD #1",
-                "Prime SWD #2"
-            ],
-            "problemMatcher": []
-        },
-        {
-            "label": "Debug Prep: Prime + Link Check",
-            "dependsOrder": "sequence",
-            "dependsOn": [
-                "Prime SWD (x2)",
-                "Debug Link Check (Fast Fail)"
-            ],
-            "problemMatcher": []
-        },
-        {
-            "label": "Prime SWD (Best Effort x4)",
-            "type": "process",
-            "command": "cmd.exe",
-            "args": [
-                "/C",
-                "C:\\Progra~1\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe -c port=SWD freq=200 mode=HOTPLUG & C:\\Progra~1\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe -c port=SWD freq=200 mode=HOTPLUG & C:\\Progra~1\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe -c port=SWD freq=200 mode=HOTPLUG & C:\\Progra~1\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe -c port=SWD freq=200 mode=HOTPLUG & exit /b 0"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Verify SWD Link (Strict)",
-            "type": "process",
-            "command": "powershell",
-            "args": [
-                "-NoProfile",
-                "-Command",
-                "$cli='C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe'; $bad='No STM32 target found|Unable to get core ID|Error: No STM32 target found|Error: Unable to get core ID'; $out1 = (& $cli -c port=SWD freq=200 mode=HOTPLUG 2>&1 | Out-String); if (($LASTEXITCODE -eq 0) -and ($out1 -notmatch $bad)) { Write-Output 'SWD OK: HOTPLUG 200 kHz'; exit 0 }; Write-Output 'SWD failed in HOTPLUG 200 kHz. Power-cycle and retry.'; exit 1"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Verify SWD Link (200 kHz Hotplug)",
-            "type": "process",
-            "command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
-            "args": [
-                "-c", "port=SWD", "freq=200", "mode=HOTPLUG"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Read Option Bytes (SWD)",
-            "type": "process",
-            "command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
-            "args": [
-                "-c", "port=SWD", "freq=200", "mode=HOTPLUG",
-                "-ob", "displ"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Serial Monitor COM6 (115200)",
-            "type": "process",
-            "command": "powershell",
-            "args": [
-                "-NoProfile",
-                "-Command",
-                "$portName='COM6'; $baud=115200; while ($true) { $port=$null; try { $port = New-Object System.IO.Ports.SerialPort $portName,$baud,'None',8,'One'; $port.NewLine = \"`r`n\"; $port.ReadTimeout = 500; $port.Open(); Write-Output \"Monitoring $portName at $baud 8N1 (Ctrl+C to stop).\"; while ($true) { try { $line = $port.ReadLine(); if ($line) { Write-Output $line } } catch [System.TimeoutException] { } } } catch { Write-Output (\"$portName not ready: \" + $_.Exception.Message); Start-Sleep -Milliseconds 800 } finally { if ($port -and $port.IsOpen) { $port.Close() } } }"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "problemMatcher": []
-        },
-        {
-            "label": "Mass Erase (SWD Hotplug)",
-            "type": "process",
-            "command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
-            "args": [
-                "-c", "port=SWD", "freq=200", "mode=HOTPLUG",
-                "-e", "all"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Connect USB DFU Only",
-            "type": "process",
-            "command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
-            "args": [
-                "-c", "port=USB1"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Mass Erase (USB DFU)",
-            "type": "process",
-            "command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
-            "args": [
-                "-c", "port=USB1",
-                "-e", "all"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Flash ELF (USB DFU)",
-            "type": "process",
-            "command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
-            "args": [
-                "-c", "port=USB1",
-                "-d", "${workspaceFolder}\\build\\Debug\\KAKUTEH7.elf"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Prompt: Switch Board To DFU Mode",
-            "type": "shell",
-            "command": "cmd",
-            "args": [
-                "/C",
-                "echo Put the board in DFU mode now. & echo Then press any key to continue with USB DFU flash. & pause"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "problemMatcher": []
-        },
-        {
-            "label": "Prompt: Exit DFU And Reboot Normal",
-            "type": "shell",
-            "command": "cmd",
-            "args": [
-                "/C",
-                "echo DFU flash finished. Set BOOT0 to normal (not DFU), power-cycle the board, then press any key to run SWD verify. & pause"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "problemMatcher": []
-        },
-        {
-            "label": "Recovery: Prompt DFU + Build + Flash + SWD Verify",
-            "dependsOrder": "sequence",
-            "dependsOn": [
-                "Prompt: Switch Board To DFU Mode",
-                "Build Debug",
-                "Flash ELF (USB DFU)",
-                "Prompt: Exit DFU And Reboot Normal",
-                "Verify SWD Link (Strict)"
-            ],
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Recovery Flow: Build + USB DFU Flash + SWD Verify",
-            "dependsOrder": "sequence",
-            "dependsOn": [
-                "Build Debug",
-                "Flash ELF (USB DFU)",
-                "Verify SWD Link (Strict)"
-            ],
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            },
-            "problemMatcher": []
-        },
-        {
-            "label": "Prepare SWD (Best Effort + Verify)",
-            "dependsOrder": "sequence",
-            "dependsOn": [
-                "Prime SWD (Best Effort x4)",
-                "Verify SWD Link (Strict)"
-            ],
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Prepare SWD (Single Prime + Verify)",
-            "dependsOrder": "sequence",
-            "dependsOn": [
-                "Prime SWD #1",
-                "Verify SWD Link (200 kHz Hotplug)"
-            ],
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Prime SWD (Adaptive Debug)",
-            "type": "process",
-            "command": "cmd.exe",
-            "args": [
-                "/C",
-                "C:\\Progra~1\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe -c port=SWD freq=200 mode=HOTPLUG & C:\\Progra~1\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe -c port=SWD freq=200 mode=HOTPLUG & C:\\Progra~1\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe -c port=SWD freq=200 mode=HOTPLUG & C:\\Progra~1\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe -c port=SWD freq=200 mode=HOTPLUG & exit /b 0"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Prepare SWD (Adaptive + Verify)",
-            "dependsOrder": "sequence",
-            "dependsOn": [
-                "Prime SWD (Adaptive Debug)",
-                "Verify SWD Link (Strict)"
-            ],
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Flash ELF via SWD (Recovery)",
-            "type": "process",
-            "command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
-            "args": [
-                "-c", "port=SWD", "freq=200", "mode=HOTPLUG",
-                "-e", "all",
-                "-d", "${workspaceFolder}\\build\\Debug\\KAKUTEH7.elf"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Prompt: Power Cycle for Debug",
-            "type": "shell",
-            "command": "cmd",
-            "args": [
-                "/C",
-                "echo Flash complete. Now POWER CYCLE the board (disconnect USB, wait 3 sec, reconnect). & echo Then press any key to start GDB server. & pause"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "problemMatcher": []
-        },
-        {
-            "label": "Prompt: Initial Power Cycle",
-            "type": "shell",
-            "command": "cmd",
-            "args": [
-                "/C",
-                "echo STEP 1: POWER CYCLE the board now (disconnect USB, wait 3 sec, reconnect). & echo Then press any key to build. & pause"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "problemMatcher": []
-        },
-        {
-            "label": "ONE CLICK: Build + Flash + Cycle + Debug",
-            "dependsOrder": "sequence",
-            "dependsOn": [
-                "Prompt: Initial Power Cycle",
-                "Build Debug",
-                "Flash ELF via SWD (Recovery)",
-                "Prompt: Power Cycle for Debug",
-                "Start ST-LINK GDB Server (Manual)"
-            ],
-            "group": "build",
-            "problemMatcher": []
-        }
-    ]
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Debug Link Check (Fast Fail)",
+			"type": "process",
+			"command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+			"args": [
+				"-c",
+				"port=SWD",
+				"freq=200",
+				"mode=HOTPLUG"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Debug Preflight (Prompt DFU On Fail)",
+			"type": "process",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"& 'C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe' -c port=SWD freq=200 mode=HOTPLUG *> $null; if ($LASTEXITCODE -eq 0) { Write-Output 'SWD link OK (200 kHz hot-plug).'; exit 0 } else { Write-Output 'SWD link failed. Please switch the board to DFU mode, then run task: Flash ELF (USB DFU).'; exit 1 }"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Start ST-LINK GDB Server (Manual)",
+			"type": "process",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$cli='C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe'; $bad='No STM32 target found|Unable to get core ID|Error: No STM32 target found|Error: Unable to get core ID'; $out1 = (& $cli -c port=SWD freq=200 mode=HOTPLUG 2>&1 | Out-String); $ok1 = ($LASTEXITCODE -eq 0) -and ($out1 -notmatch $bad); if (-not $ok1) { Write-Output 'Cannot start gdbserver: target not visible over SWD at 200 kHz hot-plug.'; exit 1 }; Get-Process -Name 'ST-LINK_gdbserver','arm-none-eabi-gdb' -ErrorAction SilentlyContinue | Stop-Process -Force; & 'C:\\Users\\marka\\AppData\\Local\\stm32cube\\bundles\\stlink-gdbserver\\7.13.0+st.3\\bin\\ST-LINK_gdbserver.exe' -c '${workspaceFolder}\\.vscode\\stlink-gdbserver.cfg'"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Build Debug",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/C",
+				"set PATH=C:\\Users\\marka\\AppData\\Local\\stm32cube\\bundles\\gnu-tools-for-stm32\\14.3.1+st.2\\bin;C:\\Users\\marka\\AppData\\Local\\stm32cube\\bundles\\ninja\\1.13.2+st.1\\bin;%PATH% && ninja -C build/Debug && arm-none-eabi-objcopy -O ihex build\\Debug\\KAKUTEH7.elf build\\Debug\\KAKUTEH7.hex"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"group": {
+				"kind": "build",
+				"isDefault": false
+			},
+			"problemMatcher": {
+				"owner": "gcc",
+				"pattern": {
+					"regexp": "^(.*):(\\d+):(\\d+):\\s+(warning|error):\\s+(.*)$",
+					"file": 1,
+					"line": 2,
+					"column": 3,
+					"severity": 4,
+					"message": 5
+				}
+			}
+		},
+		{
+			"label": "Configure & Build Debug",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/C",
+				"set PATH=C:\\Users\\marka\\AppData\\Local\\stm32cube\\bundles\\gnu-tools-for-stm32\\14.3.1+st.2\\bin;C:\\Users\\marka\\AppData\\Local\\stm32cube\\bundles\\ninja\\1.13.2+st.1\\bin;C:\\Program Files\\CMake\\bin;%PATH% && cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_TOOLCHAIN_FILE=cmake/gcc-arm-none-eabi.cmake -DCMAKE_SYSTEM_NAME=Generic -DCMAKE_SYSTEM_PROCESSOR=arm -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY -B build/Debug -S . && ninja -C build/Debug && arm-none-eabi-objcopy -O ihex build\\Debug\\KAKUTEH7.elf build\\Debug\\KAKUTEH7.hex"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Flash via SWD",
+			"type": "process",
+			"command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+			"args": [
+				"-c",
+				"port=SWD",
+				"freq=200",
+				"mode=HOTPLUG",
+				"-d",
+				"${workspaceFolder}\\build\\Debug\\KAKUTEH7.elf"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Flash via SWD (Auto Retry Once)",
+			"type": "process",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$cli='C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe'; $elf='${workspaceFolder}\\build\\Debug\\KAKUTEH7.elf'; function TestLink { & $cli -c port=SWD freq=200 mode=HOTPLUG *> $null; return ($LASTEXITCODE -eq 0) }; function FlashElf { & $cli -c port=SWD freq=200 mode=HOTPLUG -d $elf; return ($LASTEXITCODE -eq 0) }; if (TestLink -and FlashElf) { Write-Output 'SWD flash succeeded on first attempt.'; exit 0 }; Write-Output 'First SWD flash attempt failed.'; Write-Output 'Power-cycle the board now, then press Enter to retry once.'; Read-Host | Out-Null; if (TestLink -and FlashElf) { Write-Output 'SWD flash succeeded on second attempt.'; exit 0 }; Write-Output 'SWD flash failed after retry.'; exit 1"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Prompt: Power-Cycle Then Flash SWD",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/C",
+				"echo Build complete. Power-cycle/reset the board now, then press any key to continue SWD flash. & pause"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "One Click: Build + Reset Prompt + SWD Flash",
+			"dependsOrder": "sequence",
+			"dependsOn": [
+				"Build Debug",
+				"Prompt: Power-Cycle Then Flash SWD",
+				"Flash via SWD (Auto Retry Once)"
+			],
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Flash ELF via SWD (Recovery)",
+			"type": "process",
+			"command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+			"args": [
+				"-c",
+				"port=SWD",
+				"freq=200",
+				"mode=HOTPLUG",
+				"-d",
+				"${workspaceFolder}\\build\\Debug\\KAKUTEH7.elf"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Erase Sector0 then Flash ELF (Recovery)",
+			"type": "process",
+			"command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+			"args": [
+				"-c",
+				"port=SWD",
+				"freq=200",
+				"mode=HOTPLUG",
+				"-e",
+				"[0 0]",
+				"-d",
+				"${workspaceFolder}\\build\\Debug\\KAKUTEH7.elf"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Connect SWD Only (No Flash)",
+			"type": "process",
+			"command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+			"args": [
+				"-c",
+				"port=SWD",
+				"freq=200",
+				"mode=HOTPLUG"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Prime SWD HOTPLUG #1",
+			"type": "process",
+			"command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+			"args": [
+				"-c",
+				"port=SWD",
+				"freq=200",
+				"mode=HOTPLUG"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Prime SWD HOTPLUG #2",
+			"type": "process",
+			"command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+			"args": [
+				"-c",
+				"port=SWD",
+				"freq=200",
+				"mode=HOTPLUG"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Prime SWD (Double Connect)",
+			"dependsOrder": "sequence",
+			"dependsOn": [
+				"Prime SWD HOTPLUG #1",
+				"Prime SWD HOTPLUG #2"
+			],
+			"problemMatcher": []
+		},
+		{
+			"label": "Prime SWD #1",
+			"type": "process",
+			"command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+			"args": [
+				"-c",
+				"port=SWD",
+				"freq=200",
+				"mode=HOTPLUG"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Prime SWD #2",
+			"type": "process",
+			"command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+			"args": [
+				"-c",
+				"port=SWD",
+				"freq=200",
+				"mode=HOTPLUG"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Prime SWD (x2)",
+			"dependsOrder": "sequence",
+			"dependsOn": [
+				"Prime SWD #1",
+				"Prime SWD #2"
+			],
+			"problemMatcher": []
+		},
+		{
+			"label": "Debug Prep: Prime + Link Check",
+			"dependsOrder": "sequence",
+			"dependsOn": [
+				"Prime SWD (x2)",
+				"Debug Link Check (Fast Fail)"
+			],
+			"problemMatcher": []
+		},
+		{
+			"label": "Prime SWD (Best Effort x4)",
+			"type": "process",
+			"command": "cmd.exe",
+			"args": [
+				"/C",
+				"C:\\Progra~1\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe -c port=SWD freq=200 mode=HOTPLUG & C:\\Progra~1\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe -c port=SWD freq=200 mode=HOTPLUG & C:\\Progra~1\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe -c port=SWD freq=200 mode=HOTPLUG & C:\\Progra~1\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe -c port=SWD freq=200 mode=HOTPLUG & exit /b 0"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Verify SWD Link (Strict)",
+			"type": "process",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$cli='C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe'; $bad='No STM32 target found|Unable to get core ID|Error: No STM32 target found|Error: Unable to get core ID'; $out1 = (& $cli -c port=SWD freq=200 mode=HOTPLUG 2>&1 | Out-String); if (($LASTEXITCODE -eq 0) -and ($out1 -notmatch $bad)) { Write-Output 'SWD OK: HOTPLUG 200 kHz'; exit 0 }; Write-Output 'SWD failed in HOTPLUG 200 kHz. Power-cycle and retry.'; exit 1"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Verify SWD Link (200 kHz Hotplug)",
+			"type": "process",
+			"command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+			"args": [
+				"-c",
+				"port=SWD",
+				"freq=200",
+				"mode=HOTPLUG"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Read Option Bytes (SWD)",
+			"type": "process",
+			"command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+			"args": [
+				"-c",
+				"port=SWD",
+				"freq=200",
+				"mode=HOTPLUG",
+				"-ob",
+				"displ"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Serial Monitor COM6 (115200)",
+			"type": "process",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$portName='COM6'; $baud=115200; while ($true) { $port=$null; try { $port = New-Object System.IO.Ports.SerialPort $portName,$baud,'None',8,'One'; $port.NewLine = \"`r`n\"; $port.ReadTimeout = 500; $port.Open(); Write-Output \"Monitoring $portName at $baud 8N1 (Ctrl+C to stop).\"; while ($true) { try { $line = $port.ReadLine(); if ($line) { Write-Output $line } } catch [System.TimeoutException] { } } } catch { Write-Output (\"$portName not ready: \" + $_.Exception.Message); Start-Sleep -Milliseconds 800 } finally { if ($port -and $port.IsOpen) { $port.Close() } } }"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Mass Erase (SWD Hotplug)",
+			"type": "process",
+			"command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+			"args": [
+				"-c",
+				"port=SWD",
+				"freq=200",
+				"mode=HOTPLUG",
+				"-e",
+				"all"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Connect USB DFU Only",
+			"type": "process",
+			"command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+			"args": [
+				"-c",
+				"port=USB1"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Mass Erase (USB DFU)",
+			"type": "process",
+			"command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+			"args": [
+				"-c",
+				"port=USB1",
+				"-e",
+				"all"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Flash ELF (USB DFU)",
+			"type": "process",
+			"command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+			"args": [
+				"-c",
+				"port=USB1",
+				"-d",
+				"${workspaceFolder}\\build\\Debug\\KAKUTEH7.elf"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Prompt: Switch Board To DFU Mode",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/C",
+				"echo Put the board in DFU mode now. & echo Then press any key to continue with USB DFU flash. & pause"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Prompt: Exit DFU And Reboot Normal",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/C",
+				"echo DFU flash finished. Set BOOT0 to normal (not DFU), power-cycle the board, then press any key to run SWD verify. & pause"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Recovery: Prompt DFU + Build + Flash + SWD Verify",
+			"dependsOrder": "sequence",
+			"dependsOn": [
+				"Prompt: Switch Board To DFU Mode",
+				"Build Debug",
+				"Flash ELF (USB DFU)",
+				"Prompt: Exit DFU And Reboot Normal",
+				"Verify SWD Link (Strict)"
+			],
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Recovery Flow: Build + USB DFU Flash + SWD Verify",
+			"dependsOrder": "sequence",
+			"dependsOn": [
+				"Build Debug",
+				"Flash ELF (USB DFU)",
+				"Verify SWD Link (Strict)"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Prepare SWD (Best Effort + Verify)",
+			"dependsOrder": "sequence",
+			"dependsOn": [
+				"Prime SWD (Best Effort x4)",
+				"Verify SWD Link (Strict)"
+			],
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Prepare SWD (Single Prime + Verify)",
+			"dependsOrder": "sequence",
+			"dependsOn": [
+				"Prime SWD #1",
+				"Verify SWD Link (200 kHz Hotplug)"
+			],
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Prime SWD (Adaptive Debug)",
+			"type": "process",
+			"command": "cmd.exe",
+			"args": [
+				"/C",
+				"C:\\Progra~1\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe -c port=SWD freq=200 mode=HOTPLUG & C:\\Progra~1\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe -c port=SWD freq=200 mode=HOTPLUG & C:\\Progra~1\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe -c port=SWD freq=200 mode=HOTPLUG & C:\\Progra~1\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe -c port=SWD freq=200 mode=HOTPLUG & exit /b 0"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Prepare SWD (Adaptive + Verify)",
+			"dependsOrder": "sequence",
+			"dependsOn": [
+				"Prime SWD (Adaptive Debug)",
+				"Verify SWD Link (Strict)"
+			],
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Flash ELF via SWD (Recovery)",
+			"type": "process",
+			"command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+			"args": [
+				"-c",
+				"port=SWD",
+				"freq=200",
+				"mode=HOTPLUG",
+				"-e",
+				"all",
+				"-d",
+				"${workspaceFolder}\\build\\Debug\\KAKUTEH7.elf"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Prompt: Power Cycle for Debug",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/C",
+				"echo Flash complete. Now POWER CYCLE the board (disconnect USB, wait 3 sec, reconnect). & echo Then press any key to start GDB server. & pause"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Prompt: Initial Power Cycle",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/C",
+				"echo STEP 1: POWER CYCLE the board now (disconnect USB, wait 3 sec, reconnect). & echo Then press any key to build. & pause"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "ONE CLICK: Build + Flash + Cycle + Debug",
+			"dependsOrder": "sequence",
+			"dependsOn": [
+				"Prompt: Initial Power Cycle",
+				"Build Debug",
+				"Flash ELF via SWD (Recovery)",
+				"Prompt: Power Cycle for Debug",
+				"Start ST-LINK GDB Server (Manual)"
+			],
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "Flash Verified SWD",
+			"type": "shell",
+			"command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+			"args": [
+				"-c",
+				"port=SWD",
+				"freq=200",
+				"mode=HOTPLUG",
+				"-e",
+				"all",
+				"-d",
+				"${workspaceFolder}\\build\\Debug\\KAKUTEH7.elf",
+				"-v",
+				"-hardRst"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
 }

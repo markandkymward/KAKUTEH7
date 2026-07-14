@@ -6,7 +6,7 @@
 
 #include "tm_protocol.h"
 
-#define TELEMETRY_COMBINED_FAST_PAYLOAD_BYTES 54U
+#define TELEMETRY_COMBINED_FAST_PAYLOAD_BYTES 80U
 
 typedef struct {
   uint32_t cmdRxTotal;
@@ -23,9 +23,22 @@ typedef struct {
   int16_t gyroXdps10;
   int16_t gyroYdps10;
   int16_t gyroZdps10;
+  int16_t sensorGyroXraw;
+  int16_t sensorGyroYraw;
+  int16_t sensorGyroZraw;
+  int16_t bodyGyroXraw;
+  int16_t bodyGyroYraw;
+  int16_t bodyGyroZraw;
+  int16_t accelXraw;
+  int16_t accelYraw;
+  int16_t accelZraw;
   int16_t rollCd;
   int16_t pitchCd;
   int16_t yawCd;
+  int16_t q0x10000;
+  int16_t q1x10000;
+  int16_t q2x10000;
+  int16_t q3x10000;
   uint16_t rcThrottleUs;
   uint16_t rcRollUs;
   uint16_t rcPitchUs;
